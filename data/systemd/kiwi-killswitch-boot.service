@@ -1,0 +1,21 @@
+[Unit]
+Description=Kiwi kill switch — pre-network hard block
+Documentation=https://github.com/derlocke-ng/kiwi-killswitch
+# Block BEFORE anything can bring a link up. Ordering is the whole point of this
+# unit: sysinit.target + network-pre.target is the earliest slot where nftables
+# is usable, so a machine that was armed at shutdown comes back already blocked
+# and there is no window between a NIC gaining carrier and the daemon getting
+# around to loading a ruleset.
+DefaultDependencies=no
+After=local-fs.target
+Wants=network-pre.target
+Before=network-pre.target NetworkManager.service systemd-networkd.service
+ConditionPathExists=/etc/kiwi-killswitch/config.json
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/kiwi-killswitchd --restore-only
+
+[Install]
+WantedBy=sysinit.target

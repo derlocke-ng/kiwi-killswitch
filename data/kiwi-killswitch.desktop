@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Kiwi Kill Switch
+Comment=Fail-closed VPN kill switch: profiles, DNS policy, trusted kiwi-nodes
+Exec=kiwi-killswitch-settings
+Icon=channel-secure-symbolic
+Terminal=false
+Categories=System;Security;Settings;
+Keywords=vpn;killswitch;firewall;wireguard;openvpn;nftables;dns;

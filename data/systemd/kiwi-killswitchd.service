@@ -1,0 +1,24 @@
+[Unit]
+Description=Kiwi kill switch / VPN firewall daemon
+Documentation=https://github.com/derlocke-ng/kiwi-killswitch
+# Start after the system bus (needed to own the name) but before the network,
+# so the persisted armed state is enforced before anything can leak. The
+# pre-network hard block from kiwi-killswitch-boot.service is already in place
+# by this point; this replaces it with the real ruleset.
+After=dbus.service nftables.service kiwi-killswitch-boot.service
+Wants=nftables.service
+Before=NetworkManager.service systemd-networkd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/kiwi-killswitchd
+Restart=on-failure
+RestartSec=3
+# Hardening stays light on purpose: the daemon needs net admin, nft, nmcli,
+# resolvectl and /sys/class/net. Locking it down further has broken it before.
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

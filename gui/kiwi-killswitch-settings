@@ -1,0 +1,888 @@
+#!/usr/bin/env python3
+"""kiwi-killswitch-settings — GTK4/libadwaita front-end for kiwi-killswitchd.
+
+Talks to the root daemon over the D-Bus system bus. No pkexec, no polkit
+prompts: the daemon's bus policy authorizes the `wheel` group, so everything
+here is passwordless.
+
+Three things shape this UI:
+
+  * The one thing people come here for is picking WHICH VPN connection is
+    protected, so that list is on the front page, not behind a layer of saved
+    setups. There is one live configuration, not named profiles.
+  * The daemon never starts or stops a VPN. You bring your connections up in
+    GNOME Settings; the kill switch builds the firewall around whatever is
+    actually alive. The UI says so wherever it matters.
+  * Settings are STAGED. Editing a row does not change the firewall — it queues
+    a change, and the bar at the bottom applies the whole batch in one atomic
+    transaction. That is what makes "reconfigure from LAN+node to tethering+VPN
+    while already on tethering, then hit apply" leak-free: there is never a
+    half-applied state, and never a disarm in between.
+"""
+import signal
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw, Gdk, GLib, Gio  # noqa: E402
+
+APP_ID = "eu.kiwinetwork.KiwiKillSwitch"
+
+# libadwaita exports @success_color / @error_color / @warning_color / @accent_*,
+# so the palette follows the user's theme and accent instead of hard-coding one.
+CSS = b"""
+.ks-hero {
+  border-radius: 16px;
+  padding: 20px;
+  border: 1px solid alpha(currentColor, 0.08);
+}
+.ks-hero.ok   { background: alpha(@success_color, 0.13); }
+.ks-hero.bad  { background: alpha(@error_color,   0.16); }
+.ks-hero.warn { background: alpha(@warning_color, 0.14); }
+.ks-hero.off  { background: alpha(@window_fg_color, 0.06); }
+.ks-hero-icon { -gtk-icon-size: 40px; }
+.ks-hero-icon.ok   { color: @success_color; }
+.ks-hero-icon.bad  { color: @error_color; }
+.ks-hero-icon.warn { color: @warning_color; }
+.ks-hero-title { font-size: 1.45em; font-weight: 800; letter-spacing: -0.01em; }
+.ks-hero-sub   { opacity: 0.75; }
+
+.ks-pill {
+  border-radius: 999px;
+  padding: 2px 11px;
+  font-size: 0.78em;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.ks-pill.on  { background: alpha(@success_color, 0.22); color: @success_color; }
+.ks-pill.off { background: alpha(@window_fg_color, 0.10); opacity: 0.7; }
+.ks-pill.now { background: alpha(@accent_bg_color, 0.22); color: @accent_color; }
+
+.ks-applybar { padding: 6px; }
+"""
+DEST = "eu.kiwinetwork.KillSwitch"
+OBJ = "/eu/kiwinetwork/KillSwitch"
+
+DNS_MODES = [
+    ("tunnel", "Through the VPN",
+     "Use the resolver the VPN provides. Queries leave only inside the tunnel."),
+    ("system", "The network's own (trusted networks only)",
+     "Only used when the gateway matches a trusted kiwi-node. On any other "
+     "network DNS is blocked instead — an untrusted router's resolver is a "
+     "surveillance channel."),
+    ("custom", "A resolver I choose",
+     "A fixed resolver, optionally over DNS-over-TLS."),
+]
+
+HARDENING = [
+    ("standard", "Standard", "Blocks what this machine sends and receives."),
+    ("strict", "Strict (recommended)",
+     "Also blocks traffic this machine forwards for something else."),
+    ("paranoid", "Paranoid", "Also filters at the network card itself."),
+]
+
+# Short, concrete trade-offs. Every level is strictly safer than the one above
+# it and strictly more likely to get in your way, and that is the only thing
+# worth saying about them.
+# the daemon's dns_path values, in words
+DNS_PATH = {
+    "tunnel": "through the VPN",
+    "system": "the network's own resolver",
+    "custom": "a resolver you chose",
+    "fallback": "through the VPN (this network isn't trusted)",
+    "unmanaged": "left to the system (confined to the VPN)",
+    "blocked": "blocked",
+}
+
+HARDENING_DETAIL = [
+    ("standard", "Standard", "security-medium-symbolic",
+     "Least likely to break anything.",
+     "Containers, virtual machines and Waydroid can still reach the internet "
+     "even when this machine itself is blocked."),
+    ("strict", "Strict", "security-high-symbolic",
+     "Closes the container and VM hole. The sensible default.",
+     "A container is offline whenever the tunnel is down, rather than quietly "
+     "using the normal connection."),
+    ("paranoid", "Paranoid", "security-high-symbolic",
+     "Catches raw-socket traffic that no other layer can even see.",
+     "One wrong allow-rule takes this machine fully offline, so the first "
+     "apply undoes itself unless you confirm it."),
+]
+
+
+class Daemon:
+    """Thin synchronous D-Bus client for kiwi-killswitchd."""
+
+    def __init__(self):
+        self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+
+    def _call(self, method, variant=None, reply=None):
+        return self.bus.call_sync(DEST, OBJ, DEST, method, variant, reply,
+                                  Gio.DBusCallFlags.NONE, 15000, None)
+
+    def available(self):
+        try:
+            self._call("GetStatus", None, GLib.VariantType("(a{sv})"))
+            return True
+        except GLib.Error:
+            return False
+
+    def status(self):
+        return dict(self._call("GetStatus", None,
+                               GLib.VariantType("(a{sv})")).unpack()[0])
+
+    def config(self):
+        return self._call("GetConfig", None, GLib.VariantType("(a{ss})")).unpack()[0]
+
+    def pending(self):
+        return self._call("GetPending", None, GLib.VariantType("(a{ss})")).unpack()[0]
+
+    def set_pending(self, key, value):
+        self._call("SetPending", GLib.Variant("(ss)", (key, str(value))))
+
+    def apply(self):
+        self._call("Apply")
+
+    def revert(self):
+        self._call("Revert")
+
+    def confirm(self):
+        self._call("Confirm")
+
+    def list_vpns(self):
+        return self._call("ListVpns", None, GLib.VariantType("(a(sss))")).unpack()[0]
+
+    def list_nodes(self):
+        return self._call("ListNodes", None, GLib.VariantType("(aa{ss})")).unpack()[0]
+
+    def write_node(self, node):
+        self._call("WriteNode", GLib.Variant("(a{ss})", (node,)))
+
+    def delete_node(self, name):
+        self._call("DeleteNode", GLib.Variant("(s)", (name,)))
+
+    def arm(self, vpn=""):
+        self._call("Arm", GLib.Variant("(s)", (vpn,)))
+
+    def disarm(self):
+        self._call("Disarm")
+
+    def watch(self, cb):
+        self.bus.signal_subscribe(DEST, DEST, "Changed", OBJ, None,
+                                  Gio.DBusSignalFlags.NONE, lambda *_: cb())
+
+
+# ---------------------------------------------------------------------------
+def page(title, *groups):
+    pp = Adw.PreferencesPage()
+    for g in groups:
+        pp.add(g)
+    tb = Adw.ToolbarView(content=pp)
+    tb.add_top_bar(Adw.HeaderBar())
+    return Adw.NavigationPage(child=tb, title=title)
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app, daemon):
+        super().__init__(application=app, title="Kiwi Kill Switch")
+        self.set_default_size(620, 840)
+        self.d = daemon
+        self._loading = False
+        self._cfg = {}
+        self._pending = {}
+        self._status = {}
+        self._vpn_rows = []
+        self._vpn_checks = []
+        self._vpn_sync = False
+
+        self.toasts = Adw.ToastOverlay()
+        self.nav = Adw.NavigationView()
+
+        # The apply bar lives OUTSIDE the navigation view on purpose: staged
+        # changes belong to the whole configuration, not to the page you happen
+        # to be looking at, and burying Apply on one subpage is how people end
+        # up thinking a change took effect when it did not.
+        self.apply_label = Gtk.Label(xalign=0)
+        self.apply_label.add_css_class("dim-label")
+        revert = Gtk.Button(label="Discard")
+        revert.connect("clicked", lambda *_: self._revert())
+        apply_btn = Gtk.Button(label="Apply")
+        apply_btn.add_css_class("suggested-action")
+        apply_btn.connect("clicked", lambda *_: self._apply())
+        self.bar = Gtk.ActionBar()
+        self.bar.pack_start(self.apply_label)
+        self.bar.pack_end(apply_btn)
+        self.bar.pack_end(revert)
+        self.bar.set_revealed(False)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.nav.set_vexpand(True)
+        box.append(self.nav)
+        box.append(self.bar)
+        self.toasts.set_child(box)
+        self.set_content(self.toasts)
+
+        self.nav.push(self._root_page())
+        self.d.watch(lambda: GLib.idle_add(self._refresh))
+        self._refresh()
+
+    # ---------------- helpers ----------------
+    def _reload(self):
+        self._cfg = self.d.config()
+        self._pending = self.d.pending()
+        return self._cfg
+
+    def _val(self, key, default=""):
+        """The value the user should see: staged if staged, else active."""
+        return self._pending.get(key, self._cfg.get(key, default))
+
+    def _is_staged(self, key):
+        return key in self._pending
+
+    def _stage(self, key, value):
+        if self._loading:
+            return
+        try:
+            self.d.set_pending(key, "1" if value is True
+                               else "0" if value is False else value)
+        except GLib.Error as e:
+            self.toast(f"Failed: {e.message}")
+            return
+        self._refresh()
+
+    def _mark(self, row, key):
+        """Show at a glance which rows are staged but not yet applied.
+
+        Adw.EntryRow has no subtitle — it is not an Adw.ActionRow — so the
+        marker degrades to the accent class and a tooltip there."""
+        if not self._is_staged(key):
+            return row
+        row.add_css_class("accent")
+        note = "Staged — not applied yet"
+        if hasattr(row, "set_subtitle"):
+            sub = row.get_subtitle() or ""
+            if "not applied yet" not in sub:
+                row.set_subtitle(f"{sub}  •  {note}".strip(" •"))
+        else:
+            row.set_tooltip_text(note)
+        return row
+
+    def _entry(self, group, key, title, tooltip=""):
+        """Entry rows carry no subtitle, so the explanation for these lives in
+        the enclosing group's description."""
+        r = Adw.EntryRow(title=title, text=self._val(key))
+        if tooltip:
+            r.set_tooltip_text(tooltip)
+        r.set_show_apply_button(True)
+        r.connect("apply", lambda w: self._stage(key, w.get_text()))
+        group.add(self._mark(r, key))
+        return r
+
+    def _switch(self, group, key, title, subtitle=""):
+        r = Adw.SwitchRow(title=title, subtitle=subtitle)
+        r.set_active(self._val(key, "0") == "1")
+        r.connect("notify::active", lambda w, _p: self._stage(key, w.get_active()))
+        group.add(self._mark(r, key))
+        return r
+
+    def _combo(self, group, key, title, options, subtitle=""):
+        """options: [(value, label, explanation)]"""
+        values = [o[0] for o in options]
+        r = Adw.ComboRow(title=title, subtitle=subtitle)
+        r.set_model(Gtk.StringList.new([o[1] for o in options]))
+        cur = self._val(key)
+        r.set_selected(values.index(cur) if cur in values else 0)
+        r.connect("notify::selected",
+                  lambda w, _p: self._stage(key, values[w.get_selected()]))
+        group.add(self._mark(r, key))
+        return r
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast.new(text))
+
+    # ---------------- root ----------------
+    def _hero(self):
+        """A single, unmissable statement of what is happening right now.
+
+        A kill switch has exactly one question — am I protected — and burying
+        the answer in a subtitle is how people end up trusting a switch that is
+        not actually enforcing anything."""
+        self.hero_icon = Gtk.Image(icon_name="changes-allow-symbolic")
+        self.hero_icon.add_css_class("ks-hero-icon")
+        self.hero_title = Gtk.Label(xalign=0, label="Off")
+        self.hero_title.add_css_class("ks-hero-title")
+        self.hero_sub = Gtk.Label(xalign=0, label="", wrap=True, width_chars=34,
+                                  max_width_chars=48)
+        self.hero_sub.add_css_class("ks-hero-sub")
+
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                       hexpand=True, valign=Gtk.Align.CENTER)
+        text.append(self.hero_title)
+        text.append(self.hero_sub)
+
+        self.arm_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.arm_switch.connect("notify::active", self._on_arm)
+
+        self.hero = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
+        self.hero.add_css_class("ks-hero")
+        self.hero.append(self.hero_icon)
+        self.hero.append(text)
+        self.hero.append(self.arm_switch)
+        g = Adw.PreferencesGroup()
+        g.add(self.hero)
+        return g
+
+    def _root_page(self):
+        hero = self._hero()
+
+        self.warn_banner = Adw.Banner(revealed=False)
+        self.warn_banner.set_title("")
+        self.warn_banner.connect("button-clicked",
+                                 lambda *_: self._confirm_hardening())
+
+        # The connection list is the point of the application, so it is here on
+        # the front page rather than behind a navigation row.
+        self.vpn_group = Adw.PreferencesGroup(
+            title="Protected connection",
+            description="Tick the connection this kill switch protects. One at "
+                        "a time — any other tunnel you start cannot reach its "
+                        "server while armed. You connect and disconnect them "
+                        "yourself in GNOME Settings.")
+
+        nav = Adw.PreferencesGroup(title="Settings")
+        for icon, title, subtitle, builder in (
+            ("network-server-symbolic", "DNS",
+             "Where name lookups are allowed to go", self._page_dns),
+            ("network-workgroup-symbolic", "Mode and trusted node",
+             "Skip the VPN on a gateway that already tunnels", self._page_mode),
+            ("network-wired-symbolic", "kiwi-nodes",
+             "Gateways that already tunnel for you", self._page_nodes),
+            ("network-wireless-symbolic", "Reachable while armed",
+             "LAN, bypass subnets, admin access", self._page_reach),
+            ("security-high-symbolic", "Hardening",
+             "How deep the enforcement goes", self._page_hardening),
+            ("emblem-system-symbolic", "Advanced",
+             "Endpoint lookup and staging", self._page_advanced),
+        ):
+            row = Adw.ActionRow(title=title, subtitle=subtitle, activatable=True)
+            row.add_prefix(Gtk.Image(icon_name=icon))
+            row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+            row.connect("activated", lambda _r, b=builder: self._push(b))
+            nav.add(row)
+
+        pp = Adw.PreferencesPage()
+        pp.add(hero)
+        pp.add(self.vpn_group)
+        pp.add(nav)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(self.warn_banner)
+        pp.set_vexpand(True)
+        box.append(pp)
+
+        tb = Adw.ToolbarView(content=box)
+        h = Adw.HeaderBar()
+        h.set_title_widget(Adw.WindowTitle(title="Kiwi Kill Switch",
+                                           subtitle="VPN leak protection"))
+        tb.add_top_bar(h)
+        return Adw.NavigationPage(child=tb, title="Kiwi Kill Switch")
+
+    # ---------------- the connection list ----------------
+    def _rebuild_vpn_list(self):
+        """One checkable row per VPN connection NetworkManager knows about.
+
+        Rebuilt on every refresh so it tracks connections appearing, vanishing
+        and connecting without the user reopening anything."""
+        for row in self._vpn_rows:
+            self.vpn_group.remove(row)
+        self._vpn_rows = []
+        self._vpn_checks = []
+
+        try:
+            vpns = list(self.d.list_vpns())
+        except GLib.Error:
+            vpns = []
+        current = self._val("vpn")
+        live = str(self._status.get("exit_iface") or "")
+        armed = bool(self._status.get("armed"))
+
+        if not vpns:
+            row = Adw.ActionRow(
+                title="No VPN connections yet",
+                subtitle="Add a WireGuard or OpenVPN connection in "
+                         "GNOME Settings → Network, then come back")
+            row.add_prefix(Gtk.Image(icon_name="dialog-information-symbolic"))
+            self.vpn_group.add(row)
+            self._vpn_rows.append(row)
+            return
+
+        for name, typ, active in vpns:
+            connected = active == "yes"
+            row = Adw.ActionRow(title=name)
+            row.set_subtitle(typ.replace("wireguard", "WireGuard")
+                                .replace("vpn", "OpenVPN / plugin"))
+
+            chk = Gtk.CheckButton(valign=Gtk.Align.CENTER)
+            chk.set_active(name == current)
+            chk.connect("toggled", self._on_vpn_toggled, name)
+            row.add_prefix(chk)
+
+            pill = Gtk.Label(valign=Gtk.Align.CENTER)
+            pill.add_css_class("ks-pill")
+            if armed and name == current and live:
+                pill.set_label("PROTECTING")
+                pill.add_css_class("now")
+            elif connected:
+                pill.set_label("CONNECTED")
+                pill.add_css_class("on")
+            else:
+                pill.set_label("OFF")
+                pill.add_css_class("off")
+            row.add_suffix(pill)
+
+            row.set_activatable_widget(chk)
+            self._mark(row, "vpn")
+            self.vpn_group.add(row)
+            self._vpn_rows.append(row)
+            self._vpn_checks.append((chk, name))
+
+    def _on_vpn_toggled(self, btn, name):
+        """Checkboxes, but only one may be ticked.
+
+        A radio group would enforce that for free and cannot express "none",
+        which is a real choice here — you may be relying on a trusted node
+        instead. So: plain checkboxes, single selection enforced by hand."""
+        if self._loading or self._vpn_sync:
+            return
+        self._vpn_sync = True
+        try:
+            if btn.get_active():
+                for other, other_name in self._vpn_checks:
+                    if other_name != name and other.get_active():
+                        other.set_active(False)
+                target = name
+            else:
+                target = ""
+        finally:
+            self._vpn_sync = False
+        if self._val("vpn") != target:
+            self._stage("vpn", target)
+
+    def _push(self, builder):
+        self._reload()
+        self.nav.push(builder())
+
+    def _repush(self, builder):
+        """Rebuild the page we are on, so it always shows current state."""
+        self.nav.pop()
+        self._push(builder)
+
+    def _refresh(self):
+        self._loading = True
+        try:
+            st = self.d.status()
+            self._reload()
+        except GLib.Error as e:
+            self._status = {}
+            self._set_hero("off", "dialog-question-symbolic", "Daemon unavailable",
+                           "Cannot reach kiwi-killswitchd. "
+                           "Start it: sudo systemctl enable --now kiwi-killswitchd")
+            self.arm_switch.set_sensitive(False)
+            self._loading = False
+            # name ownership on the bus is asynchronous, so a call issued in the
+            # first moments can legitimately fail. Retry rather than leaving a
+            # dead window that only a restart fixes.
+            GLib.timeout_add(1000, self._refresh)
+            return False
+
+        self._status = st
+        self.arm_switch.set_sensitive(True)
+        armed = bool(st.get("armed"))
+        enforcing = bool(st.get("enforcing"))
+        detail = str(st.get("detail", ""))
+        self.arm_switch.set_active(armed)
+
+        if not armed:
+            self._set_hero("off", "changes-allow-symbolic", "Not protecting",
+                           "Normal networking. Pick a connection below and turn "
+                           "this on.")
+        elif not enforcing:
+            # INVARIANT 5: armed-but-not-enforcing looks safe and is not. This
+            # is the one state the UI must never soften.
+            self._set_hero("bad", "dialog-error-symbolic", "NOT PROTECTED",
+                           f"{detail}\nCheck: journalctl -u kiwi-killswitchd")
+        elif not st.get("exit_iface") and st.get("mode") != "node":
+            self._set_hero("warn", "network-offline-symbolic", "Blocking everything",
+                           f"{detail}\nNothing can leave until a permitted path "
+                           "is back. This is the switch working.")
+        else:
+            core = detail.split(" — conflicting tunnel")[0]
+            dns = DNS_PATH.get(str(st.get("dns_path")), str(st.get("dns_path")))
+            self._set_hero("ok", "changes-prevent-symbolic", "Protected",
+                           f"{core}  ·  DNS {dns}"
+                           f"  ·  {st.get('hardening', '?')} hardening")
+
+        self._rebuild_vpn_list()
+
+        conflicts = str(st.get("conflicts") or "")
+        prov = (armed and str(st.get("hardening")) == "paranoid"
+                and self._cfg.get("hardening_confirmed") != "1")
+        if prov:
+            self.warn_banner.set_title(
+                "Paranoid hardening is provisional — confirm while you still "
+                "have a connection")
+            self.warn_banner.set_button_label("Confirm")
+            self.warn_banner.set_revealed(True)
+        elif conflicts:
+            self.warn_banner.set_title(
+                f"Another tunnel is running: {conflicts}. It cannot reach its "
+                "server while armed.")
+            self.warn_banner.set_button_label("")
+            self.warn_banner.set_revealed(True)
+        else:
+            self.warn_banner.set_revealed(False)
+
+        n = len(self._pending)
+        self.bar.set_revealed(n > 0)
+        self.apply_label.set_label(
+            f"{n} change{'s' if n != 1 else ''} staged — not in effect yet" if n else "")
+        self._loading = False
+        return False
+
+    def _set_hero(self, tone, icon, title, subtitle):
+        for w, classes in ((self.hero, ("ok", "bad", "warn", "off")),
+                           (self.hero_icon, ("ok", "bad", "warn"))):
+            for c in classes:
+                w.remove_css_class(c)
+        self.hero.add_css_class(tone)
+        if tone in ("ok", "bad", "warn"):
+            self.hero_icon.add_css_class(tone)
+        self.hero_icon.set_from_icon_name(icon)
+        self.hero_title.set_label(title)
+        self.hero_sub.set_label(subtitle)
+
+    # ---------------- actions ----------------
+    def _on_arm(self, *_):
+        if self._loading:
+            return
+        try:
+            self.d.arm() if self.arm_switch.get_active() else self.d.disarm()
+        except GLib.Error as e:
+            self.toast(f"Failed: {e.message}")
+        self._refresh()
+
+    def _apply(self):
+        try:
+            self.d.apply()
+            self.toast("Applied")
+        except GLib.Error as e:
+            self.toast(f"Failed: {e.message}")
+        self._refresh()
+
+    def _revert(self):
+        try:
+            self.d.revert()
+            self.toast("Discarded")
+        except GLib.Error as e:
+            self.toast(f"Failed: {e.message}")
+        while self.nav.get_navigation_stack().get_n_items() > 1:
+            self.nav.pop()
+        self._refresh()
+
+    def _confirm_hardening(self):
+        try:
+            self.d.confirm()
+            self.toast("Paranoid hardening confirmed")
+        except GLib.Error as e:
+            self.toast(f"Failed: {e.message}")
+        self._refresh()
+
+    # ---------------- pages ----------------
+    def _page_mode(self):
+        nodes = list(self.d.list_nodes())
+        m = Adw.PreferencesGroup(
+            title="Mode",
+            description="Full is the kill switch. Node mode only pins DNS and "
+                        "is not leak protection.")
+        self._combo(m, "mode", "Mode", [
+            ("full", "Full kill switch",
+             "Nothing leaves except through the protected connection."),
+            ("node", "Node access (DNS only)",
+             "Internet stays open; only DNS is forced to the kiwi-node."),
+        ])
+
+        auto = self._val("auto_node", "0") == "1"
+        n = Adw.PreferencesGroup(
+            title="Trusted node",
+            description="A kiwi-node that already tunnels for you can stand in "
+                        "for the VPN on its own network, matched on IP and MAC "
+                        "together. This is opt-in: with no node picked and the "
+                        "switch below off, the VPN is always required.")
+        nn = [""] + [x.get("name", "") for x in nodes]
+        nlabels = ["None"] + [f"{x.get('name')} ({x.get('ip')})" for x in nodes]
+        combo = Adw.ComboRow(title="Satisfied by this node")
+        combo.set_subtitle("Overridden while “any node” is on" if auto
+                           else "None means the VPN is always required")
+        combo.set_model(Gtk.StringList.new(nlabels))
+        cur = self._val("trusted_node")
+        combo.set_selected(nn.index(cur) if cur in nn else 0)
+        combo.set_sensitive(not auto)
+        combo.connect("notify::selected", lambda w, _p: self._stage(
+            "trusted_node", nn[w.get_selected()]))
+        n.add(self._mark(combo, "trusted_node"))
+        self._switch(n, "auto_node", "Accept any trusted node",
+                     "Trust whichever configured node is the gateway. This "
+                     "overrides the pick above.")
+        return page("Mode and trusted node", m, n)
+
+    def _page_dns(self):
+        g = Adw.PreferencesGroup(
+            title="Lookup policy",
+            description="Applications always talk to the local resolver stub, "
+                        "so what matters is where that stub forwards to. "
+                        "Anything else is blocked outright.")
+        self._combo(g, "dns_mode", "Send lookups", DNS_MODES)
+        for value, _label, why in DNS_MODES:
+            if self._val("dns_mode") == value:
+                g.set_description(g.get_description() + "\n\n" + why)
+
+        c = Adw.PreferencesGroup(
+            title="Chosen resolver",
+            description="Used when “A resolver I choose” is selected above. "
+                        "Turn on DNS-over-TLS for a public resolver; leave it "
+                        "off for one you own on a trusted path.")
+        self._entry(c, "dns_custom", "Resolver address",
+                    "An IP address, e.g. 9.9.9.9")
+        self._switch(c, "dns_dot", "DNS-over-TLS",
+                     "Encrypt lookups to that resolver")
+
+        s_ = Adw.PreferencesGroup(
+            title="Internal names",
+            description="Extra routing domains, space separated — e.g. ~kiwi "
+                        "sends *.kiwi lookups to the chosen resolver, so "
+                        "internal names resolve the same at home and away.")
+        self._entry(s_, "dns_search", "Routing domains", "e.g. ~kiwi")
+        return page("DNS", g, c, s_)
+
+    def _page_nodes(self):
+        nodes = list(self.d.list_nodes())
+        g = Adw.PreferencesGroup(
+            title="Trusted kiwi-nodes",
+            description="Gateways that already tunnel for you, so the VPN can "
+                        "be skipped on their network. Matched on IP and MAC "
+                        "together: MAC binding defeats a hostile network "
+                        "handing out your router's address. It does not defeat "
+                        "an attacker already on the wire forging a MAC — a "
+                        "deliberate tradeoff, not an oversight.")
+        add = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER,
+                         tooltip_text="Add node")
+        add.add_css_class("flat")
+        add.connect("clicked", lambda *_: self._edit_node(None))
+        g.set_header_suffix(add)
+
+        if not nodes:
+            g.add(Adw.ActionRow(title="No nodes configured",
+                                subtitle="Use + to add one"))
+        for n in nodes:
+            sub = f"{n.get('ip', '')}  ·  {n.get('mac') or 'any MAC (weaker)'}"
+            if n.get("dns"):
+                sub += f"  ·  DNS {n['dns']}"
+            row = Adw.ActionRow(title=n.get("name", ""), subtitle=sub,
+                                activatable=True)
+            row.connect("activated", lambda _r, nd=n: self._edit_node(nd))
+            dele = Gtk.Button(icon_name="user-trash-symbolic",
+                              valign=Gtk.Align.CENTER)
+            dele.add_css_class("flat")
+            dele.add_css_class("error")
+            dele.connect("clicked", lambda _b, nm=n.get("name"): self._delete_node(nm))
+            row.add_suffix(dele)
+            row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+            g.add(row)
+        return page("kiwi-nodes", g)
+
+    def _edit_node(self, node):
+        node = node or {}
+        fields = {}
+        box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        box.add_css_class("boxed-list")
+        for key, title in (("name", "Name"), ("ip", "Gateway IP"),
+                           ("mac", "Gateway MAC"), ("dns", "Resolver on this node")):
+            r = Adw.EntryRow(title=title, text=str(node.get(key, "")))
+            fields[key] = r
+            box.append(r)
+        dlg = Adw.AlertDialog(
+            heading="Edit node" if node else "Add node",
+            body="Leave the MAC blank to match on IP alone — weaker, and any "
+                 "network can then impersonate this node.")
+        dlg.set_extra_child(box)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("save", "Save")
+        dlg.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+
+        def done(_d, resp):
+            if resp != "save":
+                return
+            try:
+                self.d.write_node({k: w.get_text().strip()
+                                   for k, w in fields.items()})
+                self.toast("Saved")
+            except GLib.Error as e:
+                self.toast(f"Failed: {e.message}")
+            self._repush(self._page_nodes)
+
+        dlg.connect("response", done)
+        dlg.present(self)
+
+    def _delete_node(self, name):
+        try:
+            self.d.delete_node(name)
+            self.toast(f"Deleted {name}")
+        except GLib.Error as e:
+            self.toast(f"Failed: {e.message}")
+        self._repush(self._page_nodes)
+
+    def _page_reach(self):
+        g = Adw.PreferencesGroup(
+            title="Things this machine may reach",
+            description="Outgoing only. Replies to connections this machine "
+                        "starts come back, but nothing on these networks can "
+                        "open a connection TO it. Every entry is a hole in the "
+                        "kill switch, so keep the list short.")
+        self._switch(g, "allow_lan", "Allow the local network",
+                     "Fills in the subnets your network cards are already on — "
+                     "printers, NAS, other machines. Same effect as typing them "
+                     "below.")
+        self._entry(g, "bypass_subnets", "Always-allowed destinations",
+                    "Space separated CIDR, e.g. 192.168.1.0/24")
+
+        a = Adw.PreferencesGroup(
+            title="Networks that may reach this machine",
+            description="Two-way, and kept off the tunnel: these are the only "
+                        "networks that can open a connection TO this machine, "
+                        "and their traffic is pinned to the physical uplink so "
+                        "a full tunnel cannot swallow it.\n\n"
+                        "Put the network you administer over SSH here, or "
+                        "arming cuts the session you are sitting in. A NAT'd "
+                        "virtual machine also belongs here — its DHCP and DNS "
+                        "arrive inbound, so the outgoing lists above will not "
+                        "cover it.")
+        self._entry(a, "allow_in_ports", "Inbound ports to keep open",
+                    "Space separated port numbers, e.g. 22")
+        self._entry(a, "mgmt_subnets", "Management networks",
+                    "Space separated CIDR, e.g. 192.168.200.0/24")
+        self._switch(a, "strict_input", "Also restrict inbound replies",
+                     "Tighter, but raises the risk of cutting a remote session. "
+                     "Leave off on a machine you administer over the network.")
+        return page("Reachable while armed", g, a)
+
+    def _page_hardening(self):
+        g = Adw.PreferencesGroup(
+            title="Enforcement depth",
+            description="Each level adds a layer the one below cannot see.")
+        self._combo(g, "hardening", "Level", HARDENING)
+
+        cur = self._val("hardening")
+        d = Adw.PreferencesGroup(title="What each level costs you")
+        for value, label, icon, pro, con in HARDENING_DETAIL:
+            row = Adw.ActionRow(title=label)
+            row.set_subtitle(f"<b>+</b>  {GLib.markup_escape_text(pro)}\n"
+                             f"<b>−</b>  {GLib.markup_escape_text(con)}")
+            row.set_subtitle_lines(0)
+            row.set_use_markup(True)
+            img = Gtk.Image(icon_name=icon)
+            if value == cur:
+                img.add_css_class("accent")
+                row.add_css_class("accent")
+            row.add_prefix(img)
+            if value == cur:
+                tag = Gtk.Label(label="IN USE", valign=Gtk.Align.CENTER)
+                tag.add_css_class("ks-pill")
+                tag.add_css_class("now")
+                row.add_suffix(tag)
+            d.add(row)
+        return page("Hardening", g, d)
+
+    def _page_advanced(self):
+        g = Adw.PreferencesGroup(
+            title="Staging",
+            description="By default a change is queued and the bar at the "
+                        "bottom applies the whole batch at once, so switching "
+                        "setup never leaves a half-applied state.")
+        self._switch(g, "instant_apply", "Apply changes immediately",
+                     "Skip staging. Convenient, but you lose the guarantee that "
+                     "a reconfiguration lands as one transaction.")
+
+        r = Adw.PreferencesGroup(
+            title="Endpoint lookup",
+            description="When a VPN's server is a hostname it has to be "
+                        "resolved before the tunnel exists — and while armed "
+                        "the normal resolver is blocked. These servers are "
+                        "queried directly over HTTPS instead. They must be IP "
+                        "addresses: a hostname here would need resolving "
+                        "first, which is the problem it exists to solve. "
+                        "Servers are space separated; the query path is "
+                        "normally /dns-query.")
+        self._entry(r, "doh_servers", "DNS-over-HTTPS servers",
+                    "Space separated IP addresses, e.g. 1.1.1.1 9.9.9.9")
+        self._entry(r, "doh_path", "Query path", "Usually /dns-query")
+        dev = Adw.PreferencesGroup(
+            title="Developer mode",
+            description="Recovery aids for working on a machine you can only "
+                        "reach over the network. They can switch your "
+                        "protection off, so they stay hidden until you ask for "
+                        "them.")
+        self._switch(dev, "developer_mode", "Show recovery aids",
+                     "Reveals the auto-disarm timer below")
+        if self._val("developer_mode", "0") == "1":
+            warn = Adw.PreferencesGroup(
+                title="Auto-disarm (deadman)",
+                description="⚠  After arming, the kill switch DISARMS ITSELF "
+                            "unless you run “kiwi-killswitch confirm” within "
+                            "this many seconds. It exists so a bad rule on a "
+                            "remote machine cannot strand you — and it means "
+                            "this machine will deliberately stop protecting "
+                            "you, unattended. 0 turns it off.\n\n"
+                            "To recover at any time, from a terminal: "
+                            "kiwi-killswitch panic")
+            self._entry(warn, "deadman_sec", "Seconds before auto-disarm",
+                        "0 disables it; anything below 30 is treated as 30")
+            return page("Advanced", g, r, dev, warn)
+        return page("Advanced", g, r, dev)
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        win = self.get_active_window()
+        if not win:
+            try:
+                d = Daemon()
+                if not d.available():
+                    raise RuntimeError("kiwi-killswitchd is not running")
+            except Exception as e:  # noqa: BLE001
+                dlg = Adw.AlertDialog(
+                    heading="Kill switch daemon unavailable",
+                    body=f"{e}\n\nStart it with:\n"
+                         "sudo systemctl enable --now kiwi-killswitchd")
+                dlg.add_response("close", "Close")
+                tmp = Adw.ApplicationWindow(application=self)
+                dlg.connect("response", lambda *_: self.quit())
+                dlg.present(tmp)
+                return
+            win = Window(self, d)
+        win.present()
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    raise SystemExit(App().run(None))

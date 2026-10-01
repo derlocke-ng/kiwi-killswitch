@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# kiwi-killswitch — terminal client for kiwi-killswitchd (talks D-Bus).
+#
+# Passwordless for members of `wheel` via the daemon's bus policy. Needs no
+# network of its own, which matters: this is the tool you reach for from a TTY
+# when the kill switch has blocked everything.
+set -euo pipefail
+
+DEST=eu.kiwinetwork.KillSwitch
+OBJ=/eu/kiwinetwork/KillSwitch
+
+call() { gdbus call --system -d "$DEST" -o "$OBJ" -m "$DEST.$1" "${@:2}"; }
+
+# GVariant dictionaries -> one "key = value" per line.
+# Two shapes come back: a{sv} wraps values in <>, a{ss} does not.
+fmt() {
+    sed -E "s/^\(\{?//; s/\}?,?\)\$//; s/, '/\n'/g" \
+    | sed -E "s/^'([A-Za-z0-9_.]+)': *<(.*)>\$/\1 = \2/; \
+              s/^'([A-Za-z0-9_.]+)': *(.*)\$/\1 = \2/" \
+    | sed -E "s/ = '(.*)'\$/ = \1/"
+}
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: kiwi-killswitch <command>
+
+  status                 what is enforced right now
+  list                   VPN connections NetworkManager knows about
+  vpn <name>             stage which connection is protected ("" for none)
+  arm [vpn]              arm the kill switch (optionally switching connection)
+  disarm                 remove all rules and restore normal networking
+
+  config                 the settings currently in effect
+  pending                staged changes, not applied yet
+  set <key> <value>      stage a change   (e.g. set dns_mode custom)
+  apply                  apply staged changes in one transaction
+  revert                 discard staged changes
+  confirm                "I am still here" — keeps hardening, stops the deadman
+  panic                  EMERGENCY: remove all protection and restore networking
+
+  nodes                  list trusted kiwi-nodes
+
+Settings: vpn, mode, trusted_node, auto_node, dns_mode, dns_custom, dns_dot,
+dns_search, bypass_subnets, allow_lan, allow_in_ports, mgmt_subnets,
+strict_input, hardening, instant_apply, doh_servers, doh_path
+
+Recovery, if the daemon is gone and you are locked out:
+  sudo nft delete table inet kiwi_ks
+  sudo nft delete table netdev kiwi_ks_egress
+USAGE
+    exit 2
+}
+
+case "${1:-status}" in
+    status)   call GetStatus | fmt ;;
+    list)     call ListVpns | sed -E "s/^\(\[?//; s/\]?,?\)$//; s/\), \(/\n/g; s/[()']//g" ;;
+    vpn)      call SetPending vpn "${2?connection name (empty for none)}" >/dev/null
+              echo "staged vpn=${2} — run 'kiwi-killswitch apply'" ;;
+    arm)      call Arm "${2:-}" >/dev/null; echo "armed" ;;
+    disarm)   call Disarm >/dev/null; echo "disarmed" ;;
+
+    config)   call GetConfig | fmt ;;
+    pending)  call GetPending | fmt ;;
+    set)      call SetPending "${2:?key}" "${3?value}" >/dev/null
+              echo "staged ${2}=${3} — run 'kiwi-killswitch apply'" ;;
+    apply)    call Apply >/dev/null; echo "applied" ;;
+    revert)   call Revert >/dev/null; echo "reverted" ;;
+    confirm)  call Confirm >/dev/null
+              echo "confirmed — hardening kept, deadman cancelled" ;;
+    panic)    # the daemon may be wedged, so try the gentle path then the blunt one
+              if call Disarm >/dev/null 2>&1; then
+                  echo "disarmed"
+              else
+                  echo "daemon not answering — tearing it down directly (needs root)" >&2
+                  exec sudo /usr/local/sbin/kiwi-killswitchd --panic
+              fi ;;
+
+    nodes)    call ListNodes \
+              | sed -E "s/^\(\[//; s/\],?\)\$//; s/\}, \{/\n/g; s/[{}]//g" \
+              | sed -E "s/'([a-z]+)': '([^']*)'/\1=\2/g; s/, /  /g" ;;
+
+    -h|--help|help) usage ;;
+    *) usage ;;
+esac
