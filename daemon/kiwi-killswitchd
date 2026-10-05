@@ -2624,6 +2624,7 @@ class Service:
         answer came out different."""
         try:
             if not self.cfg["armed"]:
+                self._fp = ""             # no baseline while disarmed
                 return True
             # INVARIANT 7. The table can vanish under us at any moment — a stray
             # `nft flush ruleset`, another admin, a tool that owns the ruleset.
@@ -2634,6 +2635,12 @@ class Service:
                 log("reconcile: our ruleset is GONE — re-asserting immediately")
                 self._on_event()
                 self._emit_changed()
+            elif not self._fp:
+                # First tick after starting or arming: there is nothing to
+                # compare against yet. Take the baseline with one quiet sync —
+                # calling that "drift" put a false alarm in the journal fifteen
+                # seconds after every start.
+                self._on_event()
             elif Net.fingerprint() != self._fp:
                 log("reconcile: network drifted without an event — re-syncing")
                 self._on_event()

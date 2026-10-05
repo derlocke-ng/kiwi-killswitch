@@ -22,6 +22,12 @@ PURGE="${KIWI_PURGE:-0}"
 
 EXT_UUID="kiwi-killswitch@kiwi-network.eu"
 BUS_NAME="eu.kiwinetwork.KillSwitch"
+# Our own tools are called by full path. A root installer does not always get
+# /usr/local on its PATH — kiwi-updater's passwordless update runs it through
+# pkexec, which resets PATH to /usr/sbin:/usr/bin — and "command not found"
+# here looked exactly like "the daemon is not answering".
+CLI=/usr/local/bin/kiwi-killswitch
+DAEMON=/usr/local/sbin/kiwi-killswitchd
 
 say()  { printf ':: %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -57,8 +63,8 @@ sys_preflight() {
 sys_install() {
     sys_preflight
     say "installing kiwi-killswitchd (root daemon) + D-Bus service"
-    install -Dm755 "$SRC/daemon/kiwi-killswitchd" /usr/local/sbin/kiwi-killswitchd
-    install -Dm755 "$SRC/bin/kiwi-killswitch"     /usr/local/bin/kiwi-killswitch
+    install -Dm755 "$SRC/daemon/kiwi-killswitchd" "$DAEMON"
+    install -Dm755 "$SRC/bin/kiwi-killswitch"     "$CLI"
     install -Dm644 "$SRC/data/dbus/$BUS_NAME.conf" \
         "/etc/dbus-1/system.d/$BUS_NAME.conf"
     install -Dm644 "$SRC/data/systemd/kiwi-killswitchd.service" \
@@ -88,7 +94,7 @@ sys_install() {
     # moments, and only the second one means the daemon is usable.
     local i ready=0
     for i in $(seq 40); do
-        if kiwi-killswitch status >/dev/null 2>&1; then ready=1; break; fi
+        if "$CLI" status >/dev/null 2>&1; then ready=1; break; fi
         sleep 0.25
     done
     if (( ! ready )); then
@@ -110,14 +116,14 @@ sys_uninstall() {
     # Disarm FIRST. Removing the daemon while armed leaves the machine blocked
     # with the tool that unblocks it already deleted.
     say "disarming before removal"
-    if ! kiwi-killswitch disarm >/dev/null 2>&1; then
+    if ! "$CLI" disarm >/dev/null 2>&1; then
         # The daemon is not answering, so nothing has undone what it changed on
         # this machine: resolver overrides, management rules, the armed flag.
         # Deleting the tables alone would leave DNS steered at a tunnel that is
         # about to be unreachable. Its panic path does the whole teardown
         # without needing the bus.
-        if [[ -x /usr/local/sbin/kiwi-killswitchd ]]; then
-            /usr/local/sbin/kiwi-killswitchd --panic >/dev/null 2>&1 || true
+        if [[ -x $DAEMON ]]; then
+            "$DAEMON" --panic >/dev/null 2>&1 || true
         fi
     fi
     nft delete table inet kiwi_ks 2>/dev/null || true
@@ -125,7 +131,7 @@ sys_uninstall() {
 
     systemctl disable --now kiwi-killswitchd.service 2>/dev/null || true
     systemctl disable --now kiwi-killswitch-boot.service 2>/dev/null || true
-    rm -f /usr/local/sbin/kiwi-killswitchd /usr/local/bin/kiwi-killswitch \
+    rm -f "$DAEMON" "$CLI" \
           "/etc/dbus-1/system.d/$BUS_NAME.conf" \
           /etc/systemd/system/kiwi-killswitchd.service \
           /etc/systemd/system/kiwi-killswitch-boot.service \

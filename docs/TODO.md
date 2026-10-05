@@ -5,6 +5,31 @@ as the code.
 
 ## Done
 
+### 2026-10-05 — 0.2.2: what delivering 0.2.0 through kiwi-updater showed
+
+0.2.0 was installed on the test box by `kiwi update` (kiwi-updater 2.0.0, both
+halves, the system half through its passwordless wrapper). It worked — and it
+said "the daemon is not answering" while doing so.
+
+- **The installer called its own CLI by name.** The passwordless path runs the
+  root installer through pkexec, which resets PATH to `/usr/sbin:/usr/bin` — no
+  `/usr/local/bin`. The readiness check could therefore never succeed: ten
+  seconds of waiting, then a warning that reads like a dead kill switch, on
+  every update. The daemon had been up and enforcing the whole time. Our own
+  tools are called by full path now.
+- **A false "network drifted" line fifteen seconds after every start**, and
+  after every arm: the first reconcile tick had no snapshot to compare against
+  and called that drift. It takes its baseline quietly.
+
+Checked before tagging: the installer under pkexec's PATH (1.9 s, no warning),
+no drift line after a restart, 191 checks in `tests/run.sh`.
+
+**There is a `v0.2.1` tag and it is identical to `v0.2.0`.** It was created on
+the wrong commit: the release command chained a "no private addresses in the
+diff" check that exits non-zero when it finds nothing, so the commit before it
+never ran — and the tag and push after it, on their own lines, did. A published
+tag is not something to move quietly, so it stays, and these fixes are 0.2.2.
+
 ### 2026-10-05 — 0.2.0: a review pass, and what it found
 
 A full read of the code, checked against the journals of two machines that had

@@ -764,6 +764,22 @@ def t_churn():
     ks.sync()
     check("but a table that vanished is reloaded", "kiwi_ks" in tables())
 
+    # the reconcile tick itself
+    svc = ksd.Service.__new__(ksd.Service)
+    svc.cfg, svc.ks, svc.conn, svc._fp, svc._last_sync = cfg, ks, None, "", time.monotonic()
+    drifts = lambda: sum(1 for line in LOG if "drifted" in line)                  # noqa: E731
+    d0 = drifts()
+    svc._reconcile()
+    svc._reconcile()
+    check("the first tick after a start takes its baseline quietly", drifts() == d0 and svc._fp != "")
+    sh("ip", "addr", "add", "192.168.62.5/24", "dev", "nic0")
+    svc._reconcile()
+    check("...and a change nobody announced is still called drift", drifts() == d0 + 1)
+    cfg["armed"] = False
+    svc._reconcile()
+    check("...and disarmed, the tick does nothing and keeps no baseline", svc._fp == "")
+    cfg["armed"] = True
+
     # the resolver path: flush once per change
     FAKE["calls"].clear()
     ev = mkev(exit="wg9", resolver="10.8.0.1", dns_link="wg9")
