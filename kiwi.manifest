@@ -1,7 +1,7 @@
 # kiwi.manifest — app metadata for the kiwi updater
 NAME=kiwi-killswitch
 DESCRIPTION=Fail-closed VPN kill switch for GNOME on Silverblue — one VPN, no leaks, no password prompts
-VERSION=0.1.0
+VERSION=0.2.0
 AUTHOR=derlocke-ng
 HOMEPAGE=https://github.com/derlocke-ng/kiwi-killswitch
 LICENSE=GPL-3.0-or-later

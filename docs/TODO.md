@@ -5,7 +5,7 @@ as the code.
 
 ## Done
 
-### 2026-10-05 — a review pass, and what it found
+### 2026-10-05 — 0.2.0: a review pass, and what it found
 
 A full read of the code, checked against the journals of two machines that had
 been running 0.1.0, then against the test box and an isolated lab. Every item
