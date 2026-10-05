@@ -6,13 +6,22 @@ Documentation=https://github.com/derlocke-ng/kiwi-killswitch
 # pre-network hard block from kiwi-killswitch-boot.service is already in place
 # by this point; this replaces it with the real ruleset.
 After=dbus.service nftables.service kiwi-killswitch-boot.service
-Wants=nftables.service
+# Ordered after nftables.service, but deliberately NOT pulling it in. Fedora's
+# unit does `nft flush ruleset` when it stops, and a Wants= here started it on
+# every machine that had left it disabled: from then on every shutdown ended by
+# flushing our tables (and firewalld's) while the links were still up, and a
+# `systemctl restart nftables` wiped them at any time. We only need the nft
+# binary, which needs no unit.
 Before=NetworkManager.service systemd-networkd.service
 
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/kiwi-killswitchd
-Restart=on-failure
+# always, not on-failure: losing the bus connection ends the process with
+# SIGTERM, which systemd counts as a clean exit — and a kill switch whose
+# daemon quietly stayed down keeps its last ruleset and stops following the
+# network
+Restart=always
 RestartSec=3
 # Hardening stays light on purpose: the daemon needs net admin, nft, nmcli,
 # resolvectl and /sys/class/net. Locking it down further has broken it before.

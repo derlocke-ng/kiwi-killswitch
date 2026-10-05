@@ -42,7 +42,10 @@ usage: kiwi-killswitch <command>
 
 Settings: vpn, mode, trusted_node, auto_node, dns_mode, dns_custom, dns_dot,
 dns_search, bypass_subnets, allow_lan, allow_in_ports, mgmt_subnets,
-strict_input, hardening, instant_apply, doh_servers, doh_path
+strict_input, hardening, hardening_confirm_sec, instant_apply, doh_servers,
+doh_path, developer_mode, deadman_sec
+
+A value the daemon cannot use is refused when you set it, with the reason.
 
 Recovery, if the daemon is gone and you are locked out:
   sudo nft delete table inet kiwi_ks
@@ -56,7 +59,17 @@ case "${1:-status}" in
     list)     call ListVpns | sed -E "s/^\(\[?//; s/\]?,?\)$//; s/\), \(/\n/g; s/[()']//g" ;;
     vpn)      call SetPending vpn "${2?connection name (empty for none)}" >/dev/null
               echo "staged vpn=${2} — run 'kiwi-killswitch apply'" ;;
-    arm)      call Arm "${2:-}" >/dev/null; echo "armed" ;;
+    arm)      call Arm "${2:-}" >/dev/null
+              # "armed" is only the intent. Report what is actually enforced,
+              # and fail loudly when nothing is — a script must be able to tell.
+              st="$(call GetStatus | fmt)"
+              detail="$(sed -n 's/^detail = //p' <<<"$st")"
+              if grep -qx 'enforcing = true' <<<"$st"; then
+                  echo "armed — ${detail}"
+              else
+                  echo "ARMED BUT NOT PROTECTED — ${detail}" >&2
+                  exit 1
+              fi ;;
     disarm)   call Disarm >/dev/null; echo "disarmed" ;;
 
     config)   call GetConfig | fmt ;;

@@ -7,7 +7,9 @@ Documentation=https://github.com/derlocke-ng/kiwi-killswitch
 # and there is no window between a NIC gaining carrier and the daemon getting
 # around to loading a ruleset.
 DefaultDependencies=no
-After=local-fs.target
+# nftables.service is only an ordering here: if an admin has enabled it and its
+# config flushes the ruleset, our block has to be loaded AFTER that, not before
+After=local-fs.target nftables.service
 Wants=network-pre.target
 Before=network-pre.target NetworkManager.service systemd-networkd.service
 ConditionPathExists=/etc/kiwi-killswitch/config.json

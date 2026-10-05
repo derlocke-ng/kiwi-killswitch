@@ -403,8 +403,9 @@ class Window(Adw.ApplicationWindow):
         except GLib.Error:
             vpns = []
         current = self._val("vpn")
-        live = str(self._status.get("exit_iface") or "")
-        armed = bool(self._status.get("armed"))
+        # only while the TUNNEL is the exit — on a trusted node the selected
+        # connection is not what is protecting anything
+        protecting = self._state(self._status) == "protected"
 
         if not vpns:
             row = Adw.ActionRow(
@@ -429,7 +430,7 @@ class Window(Adw.ApplicationWindow):
 
             pill = Gtk.Label(valign=Gtk.Align.CENTER)
             pill.add_css_class("ks-pill")
-            if armed and name == current and live:
+            if protecting and name == current:
                 pill.set_label("PROTECTING")
                 pill.add_css_class("now")
             elif connected:
@@ -498,25 +499,33 @@ class Window(Adw.ApplicationWindow):
         self._status = st
         self.arm_switch.set_sensitive(True)
         armed = bool(st.get("armed"))
-        enforcing = bool(st.get("enforcing"))
         detail = str(st.get("detail", ""))
         self.arm_switch.set_active(armed)
+        state = self._state(st)
+        core = detail.split(" — conflicting tunnel")[0]
 
-        if not armed:
+        if state == "off":
             self._set_hero("off", "changes-allow-symbolic", "Not protecting",
                            "Normal networking. Pick a connection below and turn "
                            "this on.")
-        elif not enforcing:
+        elif state == "unprotected":
             # INVARIANT 5: armed-but-not-enforcing looks safe and is not. This
             # is the one state the UI must never soften.
             self._set_hero("bad", "dialog-error-symbolic", "NOT PROTECTED",
                            f"{detail}\nCheck: journalctl -u kiwi-killswitchd")
-        elif not st.get("exit_iface") and st.get("mode") != "node":
+        elif state == "blocking":
             self._set_hero("warn", "network-offline-symbolic", "Blocking everything",
-                           f"{detail}\nNothing can leave until a permitted path "
+                           f"{core}\nNothing can leave until a permitted path "
                            "is back. This is the switch working.")
+        elif state == "dns-only":
+            # Node mode leaves the internet open. It must never be shown in the
+            # colour, or with the word, that means traffic cannot leak.
+            self._set_hero("warn", "dialog-warning-symbolic",
+                           "DNS only — not a kill switch",
+                           f"{core}\nNothing stops traffic from leaving in this "
+                           "mode. For leak protection choose “Full kill switch” "
+                           "under Mode and trusted node.")
         else:
-            core = detail.split(" — conflicting tunnel")[0]
             dns = DNS_PATH.get(str(st.get("dns_path")), str(st.get("dns_path")))
             self._set_hero("ok", "changes-prevent-symbolic", "Protected",
                            f"{core}  ·  DNS {dns}"
@@ -548,6 +557,20 @@ class Window(Adw.ApplicationWindow):
             f"{n} change{'s' if n != 1 else ''} staged — not in effect yet" if n else "")
         self._loading = False
         return False
+
+    @staticmethod
+    def _state(st):
+        """The daemon's one-word verdict. Derived here only for a daemon that
+        predates the field — updating one scope and not the other is easy."""
+        if st.get("state"):
+            return str(st["state"])
+        if not st.get("armed"):
+            return "off"
+        if not st.get("enforcing"):
+            return "unprotected"
+        if st.get("mode") == "node":
+            return "dns-only"
+        return "protected" if st.get("exit_iface") else "blocking"
 
     def _set_hero(self, tone, icon, title, subtitle):
         for w, classes in ((self.hero, ("ok", "bad", "warn", "off")),
@@ -607,7 +630,7 @@ class Window(Adw.ApplicationWindow):
         self._combo(m, "mode", "Mode", [
             ("full", "Full kill switch",
              "Nothing leaves except through the protected connection."),
-            ("node", "Node access (DNS only)",
+            ("node", "Node access (DNS only — internet stays open)",
              "Internet stays open; only DNS is forced to the kiwi-node."),
         ])
 

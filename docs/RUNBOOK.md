@@ -21,11 +21,20 @@ kiwi-killswitch apply
 
 ```bash
 sudo systemd-run --on-active=300 --unit=ks-panic \
-    /bin/sh -c 'systemctl stop kiwi-killswitchd; nft delete table inet kiwi_ks; \
-                nft delete table netdev kiwi_ks_egress'
+    /usr/local/sbin/kiwi-killswitchd --panic
 # cancel once you are satisfied:
 sudo systemctl stop ks-panic.timer
 ```
+
+`--panic` stops the daemon, drops both tables, removes the management rules,
+puts DNS back, clears the armed flag and starts the daemon again disarmed. When
+you are about to **replace** the daemon, copy the installed one aside first and
+point the timer at the copy — a safety net that runs the code under test is not
+one. Before a **reboot** while armed, make it a real unit with `OnBootSec=240`
+instead: a transient timer does not survive the reboot.
+
+Run `tests/run.sh` before any of this. It needs no root and no hardware, and it
+is much cheaper to find a regression there.
 
 Do **not** leave stale `sleep N; disarm` loops running. A forgotten one firing
 mid-test produces a convincing false "leak" reading, because a disarm really does
@@ -204,7 +213,7 @@ kiwi-killswitch status | grep hardening      # back to strict
 ```
 
 `kiwi-killswitch confirm` within the window keeps it. Escalating into paranoid
-again re-arms the deadline even for a profile confirmed before.
+again re-arms the deadline even for a setup confirmed before.
 
 ## 12. Someone removes the ruleset
 
@@ -259,6 +268,18 @@ journalctl -b -o short-precise -u kiwi-killswitch-boot -u kiwi-killswitchd \
 
 `kiwi-killswitch-boot.service` must **finish** before NetworkManager starts.
 
+After the reboot, three more things have to be true:
+
+```bash
+ip rule | grep '^90:'                 # one line per management subnet — policy
+                                      # rules do not survive a reboot; the daemon
+                                      # has to notice and put them back
+kiwi-killswitch status | grep state   # a MAC-bound trusted node is recognised
+                                      # even though the boot block was in place
+systemctl is-active nftables          # inactive, unless YOU enabled it: its stop
+                                      # action is `nft flush ruleset`
+```
+
 ## 16. Disarm restores everything
 
 ```bash
@@ -271,6 +292,42 @@ sudo cat /etc/kiwi-killswitch/config.json | python3 -c \
 curl -s https://ifconfig.me
 ```
 
+## 17. Idle is idle
+
+Armed, on a machine with a DHCP lease, touching nothing:
+
+```bash
+timeout 50 gdbus monitor --system --dest eu.kiwinetwork.KillSwitch | grep -c Changed   # 0
+journalctl -u kiwi-killswitchd --since -50s | grep -cE 'applied|drifted'                # 0
+sudo nft list chain inet kiwi_ks output | grep ks-drop-out      # counters keep counting
+```
+
+A re-apply every 15 seconds here means the network snapshot is unstable again —
+look for something in `Net.fingerprint()` that changes by itself.
+
+## 18. Bad input is refused, not stored
+
+```bash
+kiwi-killswitch set allow_in_ports '22 99999'     # an error naming the token, exit 1
+kiwi-killswitch set mgmt_subnets 192.168.0.0/255.255.0.0 && kiwi-killswitch pending
+                                                  # accepted, shown as 192.168.0.0/16
+kiwi-killswitch revert
+```
+
+## 19. What can still be reached while blocking
+
+Armed, no tunnel, no trusted node — as an ordinary user:
+
+```bash
+curl -m 6 -o /dev/null -w '%{http_code}\n' https://1.1.1.1/dns-query?name=example.com   # 000
+curl -m 6 -o /dev/null -w '%{http_code}\n' https://<your vpn server>/                    # 000
+sudo nft list chain inet kiwi_ks output | grep endpoint     # proto and port, not just an address
+```
+
+The first is the DoH bootstrap: it is for the daemon, and only while a hostname
+endpoint needs resolving. The second is the VPN server on anything but the
+tunnel's own port.
+
 ## Recovery
 
 The CLI needs no network, so a TTY is enough:
@@ -279,7 +336,13 @@ The CLI needs no network, so a TTY is enough:
 kiwi-killswitch disarm
 ```
 
-If the daemon itself is gone or wedged:
+If the daemon itself is gone or wedged, one command undoes everything:
+
+```bash
+sudo /usr/local/sbin/kiwi-killswitchd --panic      # or: kiwi-killswitch panic
+```
+
+By hand, if even that is not available:
 
 ```bash
 sudo systemctl stop kiwi-killswitchd

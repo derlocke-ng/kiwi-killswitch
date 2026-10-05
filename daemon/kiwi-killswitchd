@@ -31,6 +31,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 
 from gi.repository import GLib, Gio  # noqa: E402
 
@@ -55,7 +56,11 @@ NETDEV_TABLE = "kiwi_ks_egress"   # netdev: per-NIC egress hook
 PRIO = -10
 
 DEBOUNCE_MS = 1200        # collapse event bursts
+DEBOUNCE_MAX_MS = 5000    # ...but never sit on a pending event longer than this
 RECONCILE_SEC = 15        # safety net: catch anything both watchers miss
+RESYNC_SEC = 300          # ...and re-evaluate from scratch this often regardless
+RESOLVE_TTL = 120         # ask DoH about one hostname endpoint at most this often
+SUBPROCESS_TIMEOUT = 20   # no helper may hold the main loop for longer
 
 DEFAULTS = {
     "armed": False,                 # persisted intent, restored at boot
@@ -79,7 +84,7 @@ DEFAULTS = {
     "developer_mode": False,        # reveal the dangerous recovery aids
     "deadman_sec": 0,               # 0 = off. See KillSwitch._arm_deadman.
     "hardening_confirm_sec": 90,
-    "doh_servers": "1.1.1.1 9.9.9.9",   # IP LITERALS ONLY (see Resolver)
+    "doh_servers": "1.1.1.1 9.9.9.9",   # IP literals, optionally ip#name (see Resolver)
     "doh_path": "/dns-query",
     # --- data, not settings ---
     "nodes": [],                    # [{name, ip, mac, dns}]
@@ -108,9 +113,12 @@ BOOLS = {"dns_dot", "allow_lan", "strict_input", "hardening_confirmed",
          "instant_apply", "auto_node", "developer_mode"}
 
 HARDENING_LEVELS = ("standard", "strict", "paranoid")
+MODES = ("full", "node")
+DNS_MODES = ("tunnel", "system", "custom")
+INT_RANGE = {"hardening_confirm_sec": (15, 3600), "deadman_sec": (0, 86400)}
 
 # Our management pins carry an explicit metric so they are identifiable and can
-# be deleted precisely. See KillSwitch._del_mgmt_routes for why that matters.
+# be deleted precisely. See KillSwitch._del_one_mgmt_route for why that matters.
 MGMT_METRIC = 90
 # A policy rule is what keeps a management subnet off a full tunnel. A VPN
 # installs its own rule sending everything into a private table; a connected
@@ -146,8 +154,20 @@ INTROSPECTION = f"""
 
 # ---------------------------------------------------------------------------
 def run(cmd, **kw):
+    """Run a helper and ALWAYS come back with a result.
+
+    Everything here executes on the main loop, so a hung nmcli or resolvectl
+    would freeze the daemon — and with it every D-Bus caller — for as long as it
+    liked. A timeout turns that into one failed step. Output is decoded
+    leniently for the same reason: a connection name that is not valid UTF-8
+    must not be able to raise out of the middle of an apply."""
+    kw.setdefault("timeout", SUBPROCESS_TIMEOUT)
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, **kw)
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              errors="replace", **kw)
+    except subprocess.TimeoutExpired:
+        log(f"{cmd[0]} did not finish within {kw['timeout']}s")
+        return subprocess.CompletedProcess(cmd, 124, "", "timeout")
     except OSError as e:
         log(f"cannot run {cmd[0]}: {e}")
         return subprocess.CompletedProcess(cmd, 127, "", str(e))
@@ -157,9 +177,24 @@ def log(msg):
     print(f"kiwi-killswitchd: {msg}", file=sys.stderr, flush=True)
 
 
+_logged = set()
+
+
+def log_once(key, msg):
+    """For conditions that are re-observed on every apply and would otherwise
+    bury the journal under the same line."""
+    if key not in _logged:
+        _logged.add(key)
+        log(msg)
+
+
 def nft_apply(ruleset, path=RUNTIME_RULESET):
-    with open(path, "w") as fh:
-        fh.write(ruleset)
+    try:
+        with open(path, "w") as fh:
+            fh.write(ruleset)
+    except OSError as e:
+        log(f"cannot write {path}: {e}")
+        return False
     r = run(["nft", "-f", path])
     if r.returncode != 0:
         log(f"nft error: {r.stderr.strip()}")
@@ -171,14 +206,17 @@ def nft_drop_tables():
         run(["nft", "delete", "table", fam, tbl])
 
 
-def nft_present():
+def nft_present(netdev=False):
     """Ground truth: is our main table actually loaded in the kernel?
 
     INVARIANT 4: `nft -f` is ONE transaction — a single bad line rolls the whole
     file back. If we were disarmed at the time that leaves no table at all, i.e.
     no firewall, while the UI happily reports 'armed'. Never trust the return
     code alone; ask the kernel."""
-    return run(["nft", "list", "table", "inet", TABLE]).returncode == 0
+    if run(["nft", "list", "table", "inet", TABLE]).returncode != 0:
+        return False
+    return (not netdev
+            or run(["nft", "list", "table", "netdev", NETDEV_TABLE]).returncode == 0)
 
 
 def is_ipv6(a):
@@ -186,11 +224,58 @@ def is_ipv6(a):
 
 
 def is_literal_ip(a):
+    """A bare IPv4/IPv6 address and nothing else.
+
+    `ipaddress` accepts a zone suffix ("fe80::1%anything") and puts no limit on
+    what follows the %, so on its own it would wave arbitrary text through to a
+    ruleset. nft cannot use a scoped address anyway."""
+    if not isinstance(a, str) or "%" in a:
+        return False
     try:
         ipaddress.ip_address(a)
         return True
     except ValueError:
         return False
+
+
+def norm_subnet(s):
+    """Canonical CIDR for anything `ipaddress` can read, else "".
+
+    Canonical, not merely valid: `ipaddress` happily takes a netmask
+    ("192.168.0.0/255.255.0.0") that nft rejects, and ONE rejected token rolls
+    the whole transaction back. Everything that reaches a ruleset goes through
+    here, so nft only ever sees prefix notation."""
+    if not isinstance(s, str) or "%" in s:
+        return ""
+    try:
+        return str(ipaddress.ip_network(s.strip(), strict=False))
+    except ValueError:
+        return ""
+
+
+def valid_subnet(s):
+    return bool(norm_subnet(s))
+
+
+def _tokens(text):
+    return [t for t in re.split(r"[\s,]+", str(text or "")) if t]
+
+
+def subnets_of(text):
+    """The usable networks in a setting, canonical and de-duplicated. Lenient
+    on purpose: this is the emit-side filter, and a bad token from an old
+    config must be dropped, not allowed to break the ruleset."""
+    return list(dict.fromkeys(n for n in map(norm_subnet, _tokens(text)) if n))
+
+
+def valid_port(tok):
+    return tok.isascii() and tok.isdigit() and 1 <= int(tok) <= 65535
+
+
+def ports_of(text):
+    """The usable port numbers in a setting. `str.isdigit()` alone is not
+    enough: "99999" and "²" both pass it, and nft rejects both."""
+    return list(dict.fromkeys(str(int(t)) for t in _tokens(text) if valid_port(t)))
 
 
 # an endpoint must look like an IP or hostname (a dot or colon, only safe chars)
@@ -202,12 +287,15 @@ def valid_endpoint(ep):
     return bool(ep) and bool(_EP_RE.match(ep)) and ("." in ep or ":" in ep)
 
 
-def valid_subnet(s):
-    try:
-        ipaddress.ip_network(s, strict=False)
-        return True
-    except ValueError:
-        return False
+# The kernel allows almost anything in an interface name — quotes included —
+# and nft reads a trailing * as a wildcard. A name is written into the ruleset
+# inside double quotes, so only names that cannot end the string or change its
+# meaning are accepted; anything else is treated as "no such exit" and blocks.
+_IFACE_RE = re.compile(r"^[A-Za-z0-9_.@\-]{1,15}$")
+
+
+def valid_iface(name):
+    return isinstance(name, str) and bool(_IFACE_RE.match(name))
 
 
 def nft_ident(name):
@@ -218,6 +306,130 @@ def nft_ident(name):
 
 def truthy(v):
     return v in (True, 1, "1", "true", "True", "yes", "on")
+
+
+def int_of(v, default):
+    try:
+        return int(str(v).strip())
+    except ValueError:
+        return default
+
+
+_TRUE = ("1", "true", "yes", "on")
+_FALSE = ("0", "false", "no", "off", "")
+_HOST_RE = re.compile(r"^[A-Za-z0-9_]([A-Za-z0-9_.\-]{0,251}[A-Za-z0-9_])?\.?$")
+_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/\-]{0,200}$")
+_MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
+
+
+def _has_ctl(s):
+    return any(ord(c) < 32 or ord(c) == 127 for c in s)
+
+
+def clean_setting(key, value):
+    """Validate one setting and return it in the form it is stored in.
+
+    Raises ValueError with a message meant for a person. Nothing is staged
+    without passing through here. The bus policy lets every `wheel` process
+    call us without a password, so a value is untrusted input — and a single
+    malformed token in an nft file rolls back the whole transaction, which is
+    how a typo in a port list once left an armed machine with no table at all.
+    """
+    v = str(value)
+    if _has_ctl(v):
+        raise ValueError(f"{key}: control characters are not allowed")
+    if key == "vpn":
+        # A NetworkManager connection name is nearly free-form and only ever
+        # travels as one argv element — but a leading dash would be read as an
+        # option by nmcli and wg.
+        if len(v) > 128 or v.startswith("-"):
+            raise ValueError("vpn: not a usable connection name")
+        return v
+    v = v.strip()
+    if key in BOOLS:
+        if v.lower() in _TRUE:
+            return "1"
+        if v.lower() in _FALSE:
+            return "0"
+        raise ValueError(f"{key} is a switch — use 1 or 0")
+    if key in ("mode", "dns_mode", "hardening"):
+        allowed = {"mode": MODES, "dns_mode": DNS_MODES,
+                   "hardening": HARDENING_LEVELS}[key]
+        if v not in allowed:
+            raise ValueError(f"{key} must be one of {', '.join(allowed)}")
+        return v
+    if key in INT_RANGE:
+        lo, hi = INT_RANGE[key]
+        if not (v.isascii() and v.isdigit() and lo <= int(v) <= hi):
+            raise ValueError(f"{key} must be a whole number from {lo} to {hi}")
+        return str(int(v))
+    if key == "dns_custom":
+        if v and not is_literal_ip(v):
+            raise ValueError(f"dns_custom: '{v}' is not an IP address")
+        return str(ipaddress.ip_address(v)) if v else ""
+    if key in ("bypass_subnets", "mgmt_subnets"):
+        out = []
+        for tok in _tokens(v):
+            n = norm_subnet(tok)
+            if not n:
+                raise ValueError(f"{key}: '{tok}' is not a network — use CIDR, "
+                                 "e.g. 192.168.1.0/24")
+            out.append(n)
+        return " ".join(dict.fromkeys(out))
+    if key == "allow_in_ports":
+        out = []
+        for tok in _tokens(v):
+            if not valid_port(tok):
+                raise ValueError(f"allow_in_ports: '{tok}' is not a port (1-65535)")
+            out.append(str(int(tok)))
+        return " ".join(dict.fromkeys(out))
+    if key == "doh_servers":
+        out = []
+        for tok in _tokens(v):
+            ip, _, name = tok.partition("#")
+            if not is_literal_ip(ip) or ("#" in tok and not _HOST_RE.match(name)):
+                raise ValueError(f"doh_servers: '{tok}' must be an IP address, "
+                                 "optionally followed by #hostname")
+            out.append(tok)
+        return " ".join(dict.fromkeys(out))
+    if key == "doh_path":
+        v = v or "/dns-query"
+        if not _PATH_RE.match(v):
+            raise ValueError("doh_path must look like /dns-query")
+        return v
+    if key == "dns_search":
+        out = []
+        for tok in _tokens(v):
+            name = tok[1:] if tok.startswith("~") else tok
+            if name != "." and not _HOST_RE.match(name):
+                raise ValueError(f"dns_search: '{tok}' is not a domain")
+            out.append(tok)
+        return " ".join(dict.fromkeys(out))
+    if key == "trusted_node" and len(v) > 64:
+        raise ValueError("trusted_node: name too long")
+    return v
+
+
+def clean_node(node):
+    """A trusted-node entry, validated field by field.
+
+    `dns` is the one that matters most: it becomes the resolver address in the
+    ruleset, and it used to be stored exactly as typed. A value with a newline
+    in it was a way to write arbitrary nft statements as root — and, through
+    `include` and nft's habit of echoing the offending line, to read root-only
+    files via the journal — from any `wheel` process, without a password."""
+    out = {k: str(node.get(k, "")).strip() for k in ("name", "ip", "mac", "dns")}
+    if not out["name"] or len(out["name"]) > 64 or _has_ctl(out["name"]):
+        raise ValueError("node name required (up to 64 printable characters)")
+    if not is_literal_ip(out["ip"]):
+        raise ValueError(f"not an IP address: {out['ip'] or '(empty)'}")
+    out["ip"] = str(ipaddress.ip_address(out["ip"]))
+    out["mac"] = out["mac"].lower().replace("-", ":")
+    if out["mac"] and not _MAC_RE.match(out["mac"]):
+        raise ValueError(f"not a MAC address: {out['mac']}")
+    if out["dns"] and not is_literal_ip(out["dns"]):
+        raise ValueError(f"not an IP address: {out['dns']}")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +449,11 @@ class Resolver:
        configured DoH server ourselves, over tcp/443 to a LITERAL IP that the
        ruleset explicitly permits. No bootstrap loop, nothing to resolve first.
 
+    What this does NOT solve: the VPN client resolves its own endpoint through
+    the system resolver too, and that stays blocked while no tunnel is up. This
+    class only makes sure the address is PERMITTED once the client has it — see
+    "Known limits" in docs/TODO.md.
+
     Round-robin DNS is handled by pinning ALL returned addresses — otherwise the
     address we allowed and the one the VPN client dials can differ. Every answer
     is cached (persisted), so a boot-time restore still has addresses before the
@@ -247,13 +464,14 @@ class Resolver:
 
     def __init__(self, cfg):
         self.cfg = cfg
+        self._asked = {}            # hostname -> monotonic time of the last lookup
 
     # ---- DNS wire format (stdlib only; no dnspython on the base image) ----
     @staticmethod
     def _encode(name, qtype):
         q = b"".join(bytes([len(p)]) + p.encode("idna")
                      for p in name.rstrip(".").split("."))
-        # id 0: DoH caches on the URL, and we use POST anyway
+        # id 0, as RFC 8484 asks for with GET, so the URL is cache-friendly
         return (struct.pack(">HHHHHH", 0, 0x0100, 1, 0, 0, 0)
                 + q + b"\x00" + struct.pack(">HH", qtype, 1))
 
@@ -291,27 +509,54 @@ class Resolver:
             # CNAMEs are followed by the DoH server; we only want the addresses
         return out
 
-    def _doh_query(self, server, name, qtype):
+    def servers(self):
+        """[(ip, name the certificate is checked against)] from `doh_servers`.
+
+        An entry is an IP literal, optionally followed by #hostname in the style
+        of resolved.conf ("203.0.113.5#doh.example") for a server whose
+        certificate does not list its own address."""
+        out = []
+        for tok in (self.cfg["doh_servers"] or "").split():
+            ip, _, name = tok.partition("#")
+            if is_literal_ip(ip) and (not name or _HOST_RE.match(name)):
+                out.append((ip, name))
+        return out
+
+    def doh_ips(self):
+        return list(dict.fromkeys(ip for ip, _ in self.servers()))
+
+    def _doh_query(self, server, verify_as, name, qtype):
         wire = self._encode(name, qtype)
-        # The server is an IP literal, so there is no certificate hostname to
-        # check against it. Verification would need the provider's name, which we
-        # cannot resolve while armed — the same chicken-and-egg this class exists
-        # to break. That is acceptable here and ONLY here: a hostile answer can
-        # add an allowed destination, it cannot read tunnelled traffic, and the
-        # address is cross-checked against the cache before it replaces it.
+        # The certificate IS verified, against the address we dialled. The big
+        # public resolvers (1.1.1.1, 9.9.9.9, 8.8.8.8) all carry their IPs as
+        # subjectAltName entries, so no name has to be resolved first — the
+        # chicken-and-egg that an earlier revision used as a reason to switch
+        # verification off does not exist. It matters: an unverified answer
+        # lets whoever runs the local network decide which addresses this
+        # ruleset whitelists. A server without an IP SAN is configured as
+        # ip#hostname and checked against that name instead.
         ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        conn = http.client.HTTPSConnection(server, 443, timeout=self.TIMEOUT,
-                                           context=ctx)
+        raw = socket.create_connection((server, 443), timeout=self.TIMEOUT)
+        try:
+            tls = ctx.wrap_socket(raw, server_hostname=verify_as or server)
+        except Exception:
+            raw.close()
+            raise
+        # http.client only dials when it has no socket yet; handing it ours is
+        # how we connect to one thing (the IP) and verify another (the name)
+        conn = http.client.HTTPConnection(server, 443, timeout=self.TIMEOUT)
+        conn.sock = tls
         try:
             path = self.cfg["doh_path"] or "/dns-query"
+            if not _PATH_RE.match(path):
+                path = "/dns-query"
             # GET with base64url is the widest-supported DoH form and needs no
             # HTTP/2 (http.client is HTTP/1.1 only)
             q = base64.urlsafe_b64encode(wire).rstrip(b"=").decode()
+            host = verify_as or (f"[{server}]" if is_ipv6(server) else server)
             conn.request("GET", f"{path}?dns={q}",
                          headers={"Accept": "application/dns-message",
-                                  "Host": server})
+                                  "Host": host})
             resp = conn.getresponse()
             if resp.status != 200:
                 raise ValueError(f"http {resp.status}")
@@ -319,29 +564,35 @@ class Resolver:
         finally:
             conn.close()
 
-    def doh_ips(self):
-        return [s for s in (self.cfg["doh_servers"] or "").split()
-                if is_literal_ip(s)]
-
     def resolve(self, ep):
         if is_literal_ip(ep):
             return [ep]
         cache = self.cfg["endpoint_cache"]
+        known = [i for i in cache.get(ep, []) if is_literal_ip(i)]
+        # apply() runs on every network event, and each lookup is up to
+        # TIMEOUT seconds per server per record type ON THE MAIN LOOP. With an
+        # answer in hand there is no reason to ask again that often.
+        now = time.monotonic()
+        last = self._asked.get(ep)
+        if known and last is not None and now - last < RESOLVE_TTL:
+            return known
+        self._asked[ep] = now
         ips = []
-        for server in self.doh_ips():
+        for server, verify_as in self.servers():
             for qtype in (1, 28):
                 try:
-                    ips += self._doh_query(server, ep, qtype)
+                    ips += self._doh_query(server, verify_as, ep, qtype)
                 except Exception as e:  # noqa: BLE001 — any failure is just "try next"
                     log(f"doh {server} {ep} type{qtype}: {e}")
             if ips:
                 break
-        if not ips:
+        if not ips and not nft_present():
             # Not armed yet? then the system resolver still works and is a fine
-            # fallback. While armed it will simply fail and we fall through.
+            # fallback. With our table loaded it is blocked or steered, and
+            # asking would only stall the main loop until resolved gives up.
             try:
                 ips = [i[4][0] for i in socket.getaddrinfo(ep, None)]
-            except OSError:
+            except Exception:  # noqa: BLE001 — a malformed name raises UnicodeError, not OSError
                 ips = []
         ips = sorted({i for i in ips if is_literal_ip(i)})
         if ips:
@@ -349,7 +600,6 @@ class Resolver:
                 cache[ep] = ips
                 self.cfg.save()
             return ips
-        known = cache.get(ep, [])
         if known:
             log(f"cannot resolve {ep} — using {len(known)} cached address(es)")
         else:
@@ -361,30 +611,102 @@ class Resolver:
 class Config:
     def __init__(self):
         self.data = json.loads(json.dumps(DEFAULTS))   # deep copy
+        # True when a config file existed but could not be read. Sticky until
+        # the user disarms: it is what the status line explains itself with.
+        self.unreadable = False
         self.load()
 
+    @staticmethod
+    def _read(path):
+        with open(path) as fh:
+            cand = json.load(fh)
+        if not isinstance(cand, dict):
+            raise ValueError("not a JSON object")
+        return cand
+
     def load(self):
+        """Read the config — and FAIL CLOSED if it is there but unreadable.
+
+        A missing file is a fresh install: defaults, disarmed. A file that
+        exists and does not parse is something else entirely — a torn write, a
+        hand edit with a stray comma — and treating that as "defaults" meant a
+        machine that was armed came back up silently unprotected. So: fall back
+        to the last good copy, and if there is none, behave as armed with
+        nothing permitted until the user says otherwise."""
+        loaded = None
+        try:
+            loaded = self._read(CONFIG_JSON)
+        except FileNotFoundError:
+            loaded = {}
+        except (OSError, ValueError) as e:
+            log(f"cannot read {CONFIG_JSON}: {e}")
+            try:
+                loaded = self._read(CONFIG_JSON + ".bak")
+                log(f"using the last good copy, {CONFIG_JSON}.bak")
+            except (OSError, ValueError):
+                log("CONFIG UNREADABLE and no good copy — failing closed: "
+                    "this machine is treated as armed until it is disarmed")
+                self.unreadable = True
+        for k, v in (loaded or {}).items():
+            self.data[k] = v
+        if self.unreadable:
+            self.data["armed"] = True
+        # containers we index into must have the right shape whatever the
+        # file said — a hand-edited "nodes": null must not raise mid-apply
+        if not isinstance(self.data.get("nodes"), list):
+            self.data["nodes"] = []
+        self.data["nodes"] = [n for n in self.data["nodes"] if isinstance(n, dict)]
+        for k in ("endpoint_cache", "pending"):
+            if not isinstance(self.data.get(k), dict):
+                self.data[k] = {}
+        rt = self.data.get("runtime")
+        if not isinstance(rt, dict):
+            rt = self.data["runtime"] = {}
+        for k in ("dns_links", "mgmt_routes"):
+            if not isinstance(rt.get(k), list):
+                rt[k] = []
+
+    @staticmethod
+    def _keep_backup():
+        """Copy the current file aside — only while it is still good."""
         try:
             with open(CONFIG_JSON) as fh:
-                loaded = json.load(fh)
-            for k, v in loaded.items():
-                self.data[k] = v
+                text = fh.read()
+            if not isinstance(json.loads(text), dict):
+                return
+            with open(CONFIG_JSON + ".bak.tmp", "w") as fh:
+                fh.write(text)
+            os.replace(CONFIG_JSON + ".bak.tmp", CONFIG_JSON + ".bak")
         except (OSError, ValueError):
             pass
-        self.data.setdefault("nodes", [])
-        self.data.setdefault("endpoint_cache", {})
-        self.data.setdefault("pending", {})
-        rt = self.data.setdefault("runtime", {})
-        rt.setdefault("dns_links", [])
-        rt.setdefault("mgmt_routes", [])
 
     def save(self):
-        os.makedirs(STATE_DIR, exist_ok=True)
-        tmp = CONFIG_JSON + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(self.data, fh, indent=2, sort_keys=True)
-        os.replace(tmp, CONFIG_JSON)
-        os.chmod(CONFIG_JSON, 0o644)
+        """Persist atomically and durably. Never raises.
+
+        rename() alone is atomic but not durable: without the fsync a power
+        cut can leave the NEW name pointing at an empty file, which is exactly
+        the unreadable-config case load() has to fail closed on. And a full
+        disk must not be able to throw out of the middle of an arm — the
+        firewall matters more than the file."""
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            self._keep_backup()
+            tmp = CONFIG_JSON + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(self.data, fh, indent=2, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, CONFIG_JSON)
+            dfd = os.open(STATE_DIR, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+            return True
+        except OSError as e:
+            log(f"CANNOT SAVE the configuration: {e}")
+            return False
 
     def __getitem__(self, k):
         return self.data.get(k, DEFAULTS.get(k))
@@ -412,9 +734,7 @@ class Config:
     def set_pending(self, key, value):
         if key not in SETTABLE:
             raise ValueError(f"unknown key {key}")
-        if key == "hardening" and value not in HARDENING_LEVELS:
-            raise ValueError(f"hardening must be one of {', '.join(HARDENING_LEVELS)}")
-        self["pending"][key] = str(value)
+        self["pending"][key] = clean_setting(key, value)
         self.save()
 
     def promote(self):
@@ -452,31 +772,76 @@ class Net:
     """Thin NetworkManager / ip / wg helpers — nmcli + ip only (base image)."""
 
     VPN_TYPES = ("wireguard", "vpn", "openvpn", "tun")
+    # ARPHRD values of links that can only be a tunnel: ppp, ipip, ip6tnl, sit,
+    # gre, ip6gre, and "none" — which is what tun and WireGuard report
+    TUNNEL_ARPHRD = {512, 768, 769, 776, 778, 823, 65534}
+    PRIVATE_V4 = [ipaddress.ip_network(n) for n in
+                  ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")]
 
     @staticmethod
-    def active_vpns():
-        r = run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show", "--active"])
+    def _terse(line, fields):
+        """Split one `nmcli -t` line into `fields` columns.
+
+        Only the FIRST column — a connection name — can contain a colon, which
+        nmcli escapes as "\\:". So split from the right, then unescape. Splitting
+        from the left cut a connection called "home: wg" in two, and the kill
+        switch could never see it come up."""
+        parts = line.rsplit(":", fields - 1)
+        if len(parts) != fields:
+            return None
+        parts[0] = parts[0].replace("\\:", ":").replace("\\\\", "\\")
+        return parts
+
+    @staticmethod
+    def active_conns():
+        """(name, type, device) of every active connection of a VPN-ish type."""
         out = []
-        for line in r.stdout.splitlines():
-            name, _, typ = line.partition(":")
-            if any(t in typ for t in Net.VPN_TYPES):
-                out.append(name)
+        for line in run(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection",
+                         "show", "--active"]).stdout.splitlines():
+            p = Net._terse(line, 3)
+            if p and any(t in p[1] for t in Net.VPN_TYPES):
+                out.append(tuple(p))
         return out
 
     @staticmethod
+    def _own_tunnels(conns):
+        """The names NetworkManager gives to a plugin VPN's own tunnel DEVICE.
+
+        With OpenVPN up, NM lists two active entries: the connection itself
+        ("riseup-ovpn", type vpn, on the uplink) and a generated one for its
+        tun device ("tun0", type tun). The second is the same VPN again.
+        Counted on its own it was reported as a tunnel conflicting with the
+        very connection it belongs to, and offered in the list as something
+        you could tick. A tun that no active VPN owns — one started outside
+        NetworkManager — is left alone: that one IS a separate tunnel."""
+        tuns = [(n, d) for n, t, d in conns if t == "tun" and d]
+        if not tuns:
+            return set()
+        owned = {Net.ip_iface(n) for n, t, _ in conns if t == "vpn"}
+        return {n for n, d in tuns if d in owned}
+
+    @staticmethod
+    def active_vpns():
+        conns = Net.active_conns()
+        hide = Net._own_tunnels(conns)
+        return [n for n, _, _ in conns if n not in hide]
+
+    @staticmethod
     def all_vpns():
-        r = run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"])
-        active = set(Net.active_vpns())
+        conns = Net.active_conns()
+        hide = Net._own_tunnels(conns)
+        active = {n for n, _, _ in conns}
         out = []
-        for line in r.stdout.splitlines():
-            name, _, typ = line.partition(":")
-            if any(t in typ for t in Net.VPN_TYPES):
-                out.append((name, typ, "yes" if name in active else "no"))
+        for line in run(["nmcli", "-t", "-f", "NAME,TYPE", "connection",
+                         "show"]).stdout.splitlines():
+            p = Net._terse(line, 2)
+            if p and p[0] not in hide and any(t in p[1] for t in Net.VPN_TYPES):
+                out.append((p[0], p[1], "yes" if p[0] in active else "no"))
         return out
 
     @staticmethod
     def conn_active(conn):
-        return conn in Net.active_vpns()
+        return any(n == conn for n, _, _ in Net.active_conns())
 
     @staticmethod
     def iface_up(ifc):
@@ -499,14 +864,74 @@ class Net:
         flags = r.stdout.partition("<")[2].partition(">")[0].split(",")
         return "UP" in flags and "NO-CARRIER" not in flags
 
+    # ---- what kind of link is this? ----
+    # Three classes, and the difference is load-bearing:
+    #   tunnel   positively a tunnel device — the only thing an exit may be
+    #   uplink   a real NIC, or something stacked on one (bridge, bond, VLAN)
+    #   neither  virtual plumbing: virbr0, docker0, veth, dummy
+    # An earlier revision had one test, "no backing device in sysfs", and used
+    # it for both questions. That is true of every tunnel — and of every
+    # bridge, bond and VLAN. So a machine whose uplink is br0 passed the "a
+    # tunnel is never a physical NIC" gate with its LAN interface, and the
+    # same test hid that uplink from the node, LAN and management logic.
+
+    @staticmethod
+    def _sys(ifc, leaf):
+        try:
+            with open(f"/sys/class/net/{ifc}/{leaf}") as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def is_physical(ifc):
+        return (bool(ifc) and ifc != "lo"
+                and os.path.exists(f"/sys/class/net/{ifc}/device"))
+
+    @staticmethod
+    def physical_under(ifc, _depth=0):
+        """The real NICs an interface ultimately sends through — itself if it
+        is one, else whatever it is stacked on (sysfs `lower_*` links)."""
+        if Net.is_physical(ifc):
+            return {ifc}
+        if not ifc or _depth > 4:
+            return set()
+        try:
+            lowers = [n[6:] for n in os.listdir(f"/sys/class/net/{ifc}")
+                      if n.startswith("lower_")]
+        except OSError:
+            return set()
+        out = set()
+        for low in lowers:
+            out |= Net.physical_under(low, _depth + 1)
+        return out
+
+    @staticmethod
+    def is_uplink(ifc):
+        return bool(ifc) and ifc != "lo" and bool(Net.physical_under(ifc))
+
     @staticmethod
     def is_tunnel(ifc):
-        """INVARIANT 2: a tunnel is never a physical NIC. Physical devices have a
-        backing device in sysfs; tun/tap/wg/ppp do not — this beats a name
-        whitelist, which rejects legitimately-named tunnels (nordlynx, proton0)."""
+        """INVARIANT 2: an exit must be a tunnel, identified POSITIVELY.
+
+        WireGuard announces itself in uevent, tun/tap devices carry tun_flags,
+        and the classic kernel tunnels have their own ARPHRD type. Anything
+        that is hardware, sits on hardware, or is a bridge, a bond or a bridge
+        port is not one, whatever it is called. A name whitelist would be the
+        wrong tool in the other direction — it rejects legitimately-named
+        tunnels (nordlynx, proton0)."""
         if not ifc or ifc == "lo":
             return False
-        return not os.path.exists(f"/sys/class/net/{ifc}/device")
+        base = f"/sys/class/net/{ifc}"
+        if not os.path.isdir(base) or Net.physical_under(ifc):
+            return False
+        if any(os.path.exists(f"{base}/{d}") for d in ("bridge", "bonding", "brport")):
+            return False
+        if "DEVTYPE=wireguard" in Net._sys(ifc, "uevent"):
+            return True
+        if os.path.exists(f"{base}/tun_flags"):
+            return True
+        return int_of(Net._sys(ifc, "type"), -1) in Net.TUNNEL_ARPHRD
 
     @staticmethod
     def physical_nics():
@@ -517,8 +942,7 @@ class Net:
             names = sorted(os.listdir("/sys/class/net"))
         except OSError:
             return []
-        return [n for n in names
-                if n != "lo" and os.path.exists(f"/sys/class/net/{n}/device")]
+        return [n for n in names if Net.is_physical(n)]
 
     @staticmethod
     def _addr_owner(addrs):
@@ -575,39 +999,94 @@ class Net:
         r = run(["ip", "-o", "addr", "show", "dev", ifc])
         return [ln.split()[3] for ln in r.stdout.splitlines() if len(ln.split()) > 3]
 
+    # ---- endpoints: (host, proto, port) ----
+    @staticmethod
+    def _split_hostport(tok):
+        """'host', 'host:port', '[v6]:port', 'host:port:proto' -> (host, port, proto)."""
+        tok = tok.strip().replace("\\", "")
+        if is_literal_ip(tok):                  # a bare address, v6 included
+            return tok, "", ""
+        if tok.startswith("["):
+            host, _, rest = tok[1:].partition("]")
+            parts = [x for x in rest.split(":") if x]
+        else:
+            parts = tok.split(":")
+            host, parts = parts[0], parts[1:]
+        port = parts[0] if parts and parts[0].isdigit() else ""
+        proto = parts[1].lower() if len(parts) > 1 else ""
+        return host, port, proto
+
+    @staticmethod
+    def _vpn_data(spec):
+        """NetworkManager's vpn.data as a dict. nmcli joins the pairs with ", "
+        and escapes a comma INSIDE a value as "\\," — so `remote` survives."""
+        text = run(["nmcli", "-t", "-f", "vpn.data", "connection",
+                    "show", spec]).stdout.strip()
+        if text.startswith("vpn.data:"):
+            text = text[len("vpn.data:"):]
+        out = {}
+        for pair in re.split(r"(?<!\\),\s*", text):
+            k, sep, v = pair.partition(" = ")
+            if sep:
+                out[k.strip()] = v.strip()
+        return out
+
     @staticmethod
     def static_endpoints(spec):
         """INVARIANT 6: endpoints from the connection's SAVED config, so they work
         while the connection is inactive — the fail-closed firewall must permit
-        the handshake before the tunnel exists."""
+        the handshake before the tunnel exists.
+
+        The protocol and port come along, so the hole can be exactly as wide as
+        the tunnel's own traffic. Where they cannot be determined they are left
+        empty and the caller allows the address as a whole."""
         eps = []
         out = run(["nmcli", "-t", "-f", "wireguard.peers", "connection",
                    "show", spec]).stdout
         for m in re.finditer(r"endpoint=([^,\s]+)", out):
-            eps.append(m.group(1))
-        if not eps:
-            data = run(["nmcli", "-t", "-f", "vpn.data", "connection",
-                        "show", spec]).stdout
-            # nmcli separates vpn.data keys with ", " and escapes commas INSIDE a
-            # value as "\," — the remote value ends at the first unescaped ", ".
-            m = re.search(r"remote = ((?:\\,|[^,])+)", data)
-            if m:
-                eps = [r0.strip() for r0 in m.group(1).split("\\,")]
+            host, port, _ = Net._split_hostport(m.group(1))
+            eps.append((host, "udp", port))
+        if eps:
+            return eps
+        data = Net._vpn_data(spec)
+        if data.get("proxy-server"):
+            # through a proxy, the proxy is the only thing OpenVPN ever dials
+            return [(data["proxy-server"], "tcp", data.get("proxy-port", ""))]
+        proto = "tcp" if truthy(data.get("proto-tcp", "")) else "udp"
+        for tok in data.get("remote", "").split("\\,"):
+            if not tok.strip():
+                continue
+            host, port, p = Net._split_hostport(tok)
+            if p.startswith("tcp"):
+                eproto = "tcp"
+            elif p.startswith("udp"):
+                eproto = "udp"
+            else:
+                eproto = proto
+            eps.append((host, eproto, port or data.get("port", "") or "1194"))
+        return eps
+
+    @staticmethod
+    def _wg_endpoints(iface):
+        eps = []
+        for ln in run(["wg", "show", iface, "endpoints"]).stdout.splitlines():
+            f = ln.split()
+            if len(f) > 1 and f[1] != "(none)":
+                host, port, _ = Net._split_hostport(f[1])
+                eps.append((host, "udp", port))
         return eps
 
     @staticmethod
     def resolve_layer(spec):
-        """(iface, [endpoint hostnames/ips]) for a VPN connection or raw iface."""
+        """(iface, [(host, proto, port)]) for a VPN connection or raw iface."""
         iface, eps = "", []
         if run(["wg", "show", spec]).returncode == 0:          # native wg iface
             iface = spec
-            r = run(["wg", "show", spec, "endpoints"])
-            eps = [l.split()[1] for l in r.stdout.splitlines() if len(l.split()) > 1]
+            eps = Net._wg_endpoints(spec)
         elif Net.conn_active(spec):
             iface = Net.ip_iface(spec)
             if iface and Net.iface_up(iface) and run(["wg", "show", iface]).returncode == 0:
-                r = run(["wg", "show", iface, "endpoints"])
-                eps = [l.split()[1] for l in r.stdout.splitlines() if len(l.split()) > 1]
+                eps = Net._wg_endpoints(iface)
         elif spec and Net.iface_up(spec):
             iface = spec
         if not eps:
@@ -615,19 +1094,23 @@ class Net:
 
         if iface and not Net.iface_up(iface):
             iface = ""
-        # SECURITY: reject a physical NIC masquerading as the tunnel — accepting
-        # one would turn the "exit interface" rule into "allow everything out".
+        # SECURITY: reject anything that is not positively a tunnel — accepting
+        # an uplink here would turn the "exit interface" rule into "allow
+        # everything out".
         if iface and not Net.is_tunnel(iface):
             log(f"ignoring non-tunnel iface '{iface}' for '{spec}'")
             iface = ""
 
         clean = []
-        for e in eps:
-            e = e.rsplit(":", 1)[0].strip("[]")     # drop :port, unwrap [v6]
-            if valid_endpoint(e):
-                clean.append(e)
-            elif e:
-                log(f"dropping invalid endpoint token {e!r} for '{spec}'")
+        for host, proto, port in eps:
+            host = host.strip("[]")
+            if not valid_endpoint(host):
+                if host:
+                    log(f"dropping invalid endpoint token {host!r} for '{spec}'")
+                continue
+            if proto not in ("udp", "tcp") or not valid_port(port):
+                proto, port = "", ""            # unknown: allow the address
+            clean.append((host, proto, port))
         return iface, list(dict.fromkeys(clean))
 
     @staticmethod
@@ -652,29 +1135,39 @@ class Net:
         return sorted(out, key=lambda r: r[2])
 
     @staticmethod
-    def default_gw():
-        r = Net.default_routes()
-        return (r[0][0], r[0][1]) if r else ("", "")
-
-    @staticmethod
     def physical_gw():
         """The uplink *underneath* any tunnel. Management routes must use this,
         else they follow a full-tunnel default route into the VPN and the box
         drops off its admin LAN the moment you arm."""
         for gw, dev, _m in Net.default_routes():
-            if gw and not Net.is_tunnel(dev):
+            if gw and Net.is_uplink(dev):
                 return gw, dev
         return "", ""
 
     @staticmethod
     def lan_subnets():
-        """On-link subnets of the physical NICs (for allow_lan / netdev)."""
+        """On-link PRIVATE subnets of the uplinks (for allow_lan / netdev).
+
+        Private only, on purpose. "The local network" is whatever the network
+        says it is: an access point that leases you 11.0.0.5/1 has just told
+        you that half the internet is on-link, and allowing "the LAN" would
+        then allow exactly that, around the tunnel (the LocalNet attack from
+        TunnelCrack). A real LAN is RFC1918 or link-local; anything else is
+        left out, and can still be added by hand under bypass_subnets."""
         out = []
         for ln in run(["ip", "-o", "-4", "addr", "show", "scope", "global"]).stdout.splitlines():
             f = ln.split()
-            if len(f) > 3 and not Net.is_tunnel(f[1]):
+            if len(f) < 4 or not Net.is_uplink(f[1]):
+                continue
+            try:
                 net = ipaddress.ip_network(f[3], strict=False)
+            except ValueError:
+                continue
+            if any(net.subnet_of(p) for p in Net.PRIVATE_V4):
                 out.append(str(net))
+            else:
+                log_once(f"lan:{net}", f"allow_lan: leaving out {net} on {f[1]} "
+                                       "— not a private range")
         return list(dict.fromkeys(out))
 
     @staticmethod
@@ -701,15 +1194,10 @@ class Net:
 
         Such a subnet must never be pinned through a gateway: the kernel
         already reaches it directly, and forcing it via a router breaks return
-        traffic outright.
-
-        The case that bites is a libvirt or podman bridge. `is_tunnel()` works
-        by "has no backing device in sysfs", which is the right test for
-        spotting a real tunnel but also true of every bridge — so the naive
-        "is this routed via a tunnel" question answers *yes* for a NAT'd VM's
-        own subnet, and the pin then routes the VM network out the physical NIC
-        and severs the host from its guests. The same reasoning protects the
-        admin LAN, which is normally on-link too.
+        traffic outright. That covers the admin LAN, which is normally on-link,
+        and a libvirt or podman bridge's own subnet — pinning that one would
+        route the VM network out the physical NIC and sever the host from its
+        guests.
         """
         try:
             net = ipaddress.ip_network(subnet, strict=False)
@@ -735,23 +1223,54 @@ class Net:
         return "dev" in p and Net.is_tunnel(p[p.index("dev") + 1])
 
     @staticmethod
-    def mac_of(ip):
-        run(["ping", "-c1", "-W1", ip])
-        p = run(["ip", "neigh", "show", ip]).stdout.split()
-        return p[p.index("lladdr") + 1].lower() if "lladdr" in p else ""
+    def arp_mac(ip, dev, timeout=1.0):
+        """Ask for an IPv4 neighbour's MAC ourselves, with one ARP request.
+
+        The obvious way — ping it, then read the kernel's neighbour table —
+        does not work for us: the ping is an ordinary packet, so our own drop
+        policy stops it before the kernel ever has a reason to send ARP.
+        Coming up armed after a reboot, that left a MAC-bound node permanently
+        unrecognised. ARP is not IP: it never traverses the inet hooks, and the
+        netdev chain passes it explicitly, so a raw request works in every
+        state — and it tells the local segment nothing DHCP has not already.
+        """
+        src = next((s.split("/")[0] for s in Net.iface_subnets(dev) if ":" not in s), "")
+        try:
+            target, sender = socket.inet_aton(ip), socket.inet_aton(src)
+            s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+        except OSError:
+            return ""
+        try:
+            s.bind((dev, 0x0806))
+            mac = s.getsockname()[4]
+            s.send(b"\xff" * 6 + mac + b"\x08\x06"
+                   + struct.pack(">HHBBH", 1, 0x0800, 6, 4, 1)
+                   + mac + sender + b"\x00" * 6 + target)
+            end = time.monotonic() + timeout
+            while True:
+                left = end - time.monotonic()
+                if left <= 0:
+                    return ""
+                s.settimeout(left)
+                pkt = s.recv(128)
+                # eth(14) + arp: htype ptype hlen plen | op(20) | sha(22) spa(28)
+                if (len(pkt) >= 42 and pkt[12:14] == b"\x08\x06"
+                        and pkt[20:22] == b"\x00\x02" and pkt[28:32] == target):
+                    return ":".join(f"{b:02x}" for b in pkt[22:28])
+        except OSError:
+            return ""
+        finally:
+            s.close()
 
     @staticmethod
-    def reachable(addr):
-        return run(["ping", "-c1", "-W1", addr.split("/")[0]]).returncode == 0
-
-    @staticmethod
-    def conn_for_dev(dev):
-        for ln in run(["nmcli", "-t", "-f", "NAME,DEVICE", "connection", "show",
-                       "--active"]).stdout.splitlines():
-            name, _, d = ln.rpartition(":")
-            if d == dev:
-                return name
-        return ""
+    def gw_mac(ip, dev):
+        """The gateway's MAC as it answers right now, else whatever the kernel
+        last learned (the only source for an IPv6 gateway)."""
+        mac = "" if is_ipv6(ip) else Net.arp_mac(ip, dev)
+        if not mac:
+            p = run(["ip", "neigh", "show", ip, "dev", dev]).stdout.split()
+            mac = p[p.index("lladdr") + 1] if "lladdr" in p[:-1] else ""
+        return mac.lower()
 
     @staticmethod
     def conn_dns(conn):
@@ -791,13 +1310,23 @@ class Net:
                 out.append(val)
         return out
 
+    _LIFETIME = re.compile(r"\s+(?:valid_lft|preferred_lft)\s+\S+")
+
     @staticmethod
     def fingerprint():
-        """Cheap snapshot of everything the ruleset depends on: which links are
-        up, what addresses they carry, and where the default route points."""
+        """Cheap snapshot of what the ruleset depends on: which links are up,
+        what addresses they carry, where the default route points, and which
+        way the kernel actually sends traffic.
+
+        Address LIFETIMES are cut out. `ip addr` prints the seconds a DHCP
+        lease has left, so the raw text differs on every reading — which made
+        the reconcile loop see "drift" every single tick on any DHCP machine
+        and re-apply everything, counters, DNS cache and all, four times a
+        minute for as long as the switch was armed."""
         return (run(["ip", "-o", "link", "show", "up"]).stdout
-                + run(["ip", "-o", "addr", "show"]).stdout
-                + run(["ip", "-o", "route", "show", "default"]).stdout)
+                + Net._LIFETIME.sub("", run(["ip", "-o", "addr", "show"]).stdout)
+                + run(["ip", "-o", "route", "show", "default"]).stdout
+                + Net.route_dev())
 
 
 # ---------------------------------------------------------------------------
@@ -807,8 +1336,8 @@ class Eval:
     def __init__(self):
         self.exit_iface = ""        # the ONE interface general traffic may use
         self.exit_is_tunnel = True  # False when a trusted node's uplink is the exit
-        self.endpoints = []         # literal IPs of the selected VPN's server(s)
-        self.subnets = []           # the tunnel's own subnets
+        self.endpoints = []         # (ip, proto, port) of the selected VPN's server(s)
+        self.hostnames = False      # ...at least one of which is configured by NAME
         self.conflicts = []         # other active VPNs — they fight our routing
         self.node = None            # matched trusted kiwi-node, if any
         self.complete = False       # is there a permitted path at all?
@@ -850,20 +1379,21 @@ class Situation:
         using the other uplink's WAN. Which route the kernel actually prefers is
         a separate question, reported as `node_not_preferred`.
 
-        Routes through a tunnel are skipped: a node is an uplink that tunnels
-        *for* us, so reaching one through a VPN we already have proves nothing.
+        Only real uplinks count. A node is an uplink that tunnels *for* us, so
+        reaching one through a VPN we already have proves nothing — and
+        neither does a default route through virtual plumbing.
         """
         preferred_dev = Net.route_dev()
         for gw, dev, _metric in Net.default_routes():
-            if not gw or Net.is_tunnel(dev):
+            if not gw or not Net.is_uplink(dev):
                 continue
             for n in self.cfg["nodes"]:
                 if n.get("ip") != gw:
                     continue
                 if wanted and n.get("name") != wanted:
                     continue
-                mac = (n.get("mac") or "").lower()
-                if mac and Net.mac_of(gw) != mac:
+                mac = str(n.get("mac") or "").lower()
+                if mac and Net.gw_mac(gw, dev) != mac:
                     log(f"node {n.get('name')}: ip matches but MAC does not "
                         "— not trusted")
                     continue
@@ -901,8 +1431,12 @@ class Situation:
         vpn_ifc = ""
         if p["vpn"]:
             vpn_ifc, raw = Net.resolve_layer(p["vpn"])
-            ev.endpoints = list(dict.fromkeys(
-                ip for e in raw for ip in self.resolver.resolve(e)))
+            eps = []
+            for host, proto, port in raw:
+                if not is_literal_ip(host):
+                    ev.hostnames = True
+                eps += [(ip, proto, port) for ip in self.resolver.resolve(host)]
+            ev.endpoints = list(dict.fromkeys(eps))
             if not vpn_ifc and Net.conn_active(p["vpn"]):
                 # NetworkManager still lists the connection as activated while
                 # its tunnel is dead at the link level — GNOME's own UI shows a
@@ -927,8 +1461,12 @@ class Situation:
         elif node and node_dev:
             ev.exit_iface, ev.exit_is_tunnel, ev.complete = node_dev, False, True
             ev.node_not_preferred = node_dev != live
-        if ev.exit_iface:
-            ev.subnets = Net.iface_subnets(ev.exit_iface)
+        if ev.exit_iface and not valid_iface(ev.exit_iface):
+            # it would be written into the ruleset inside quotes — see _IFACE_RE
+            log(f"interface name {ev.exit_iface!r} cannot be used in a ruleset "
+                "— treating it as no exit")
+            ev.exit_iface, ev.exit_is_tunnel, ev.complete = "", True, False
+            ev.node = node = None
         if ev.exit_is_tunnel:
             ev.node = node = None
             ev.node_not_preferred = False
@@ -941,6 +1479,11 @@ class Situation:
     def _pick_dns(self, ev):
         p = self.p
         mode = p["dns_mode"]
+        # a node's resolver was stored unvalidated by older versions; it is
+        # about to become a ruleset token, so it is checked here regardless
+        node_dns = str((ev.node or {}).get("dns") or "")
+        if not is_literal_ip(node_dns):
+            node_dns = ""
         if mode == "custom" and is_literal_ip(p["dns_custom"]):
             ev.resolver, ev.dns_path = p["dns_custom"], "custom"
             ev.dns_link = ev.exit_iface or Net.physical_gw()[1]
@@ -949,7 +1492,7 @@ class Situation:
             # An untrusted cafe router's DNS is a surveillance channel, and it
             # is the one thing a kill switch must not wave through.
             if ev.node:
-                ev.resolver = ev.node.get("dns") or ""
+                ev.resolver = node_dns
                 ev.dns_link = ev.exit_iface
                 ev.dns_path = "system" if ev.resolver else "blocked"
             elif ev.exit_iface and ev.exit_is_tunnel:
@@ -969,8 +1512,8 @@ class Situation:
                 ev.dns_path = "blocked"
         else:                                   # tunnel (default)
             cand = Net.conn_dns(p["vpn"]) if p["vpn"] else []
-            if not cand and ev.node and ev.node.get("dns"):
-                cand = [ev.node["dns"]]
+            if not cand and node_dns:
+                cand = [node_dns]
             if not cand and is_literal_ip(p["dns_custom"]):
                 cand = [p["dns_custom"]]
             if cand and ev.exit_iface:
@@ -989,6 +1532,11 @@ class Firewall:
     new ones are not in place yet. The `add table` + `delete table` + re-add
     idiom is what makes that idempotent (`add table` is a no-op if it exists,
     unlike `add chain`, so the `delete` below it is always safe).
+
+    Every token that originates outside this file — a subnet, a port, an
+    address, an interface name — is re-validated here on its way in, whatever
+    was checked when it was stored. The config can predate the checks, and one
+    token nft dislikes costs the whole transaction.
     """
 
     def __init__(self, cfg):
@@ -1000,26 +1548,62 @@ class Firewall:
         return "{ %s }" % ", ".join(f'"{n}"' for n in names)
 
     @staticmethod
-    def _addr_rules(ips, tail, comment):
+    def _addr_rules(ips, tail, comment, head=""):
         """One rule per family; nft will not mix ip and ip6 in a set."""
         out = []
+        ips = [a for a in dict.fromkeys(ips) if is_literal_ip(a)]
         for fam, sel in (("ip", False), ("ip6", True)):
             batch = [a for a in ips if is_ipv6(a) == sel]
             if not batch:
                 continue
             addrs = "{ %s }" % ", ".join(batch) if len(batch) > 1 else batch[0]
-            out.append(f'    {fam} daddr {addrs} {tail}accept comment "{comment}"')
+            out.append(f'    {head}{fam} daddr {addrs} {tail}accept comment "{comment}"')
         return out
 
     @staticmethod
-    def _subnet_rules(subnets, comment, indent="    "):
+    def _subnet_rules(subnets, comment, sel="daddr", tail=""):
         out = []
-        for sn in dict.fromkeys(s for s in subnets if valid_subnet(s)):
+        for sn in dict.fromkeys(n for n in map(norm_subnet, subnets) if n):
             fam = "ip6" if is_ipv6(sn) else "ip"
-            out.append(f'{indent}{fam} daddr {sn} accept comment "{comment}"')
+            out.append(f'    {fam} {sel} {sn} {tail}accept comment "{comment}"')
         return out
 
-    def _dns_backstop(self, resolver):
+    def _endpoint_rules(self, eps, comment):
+        """The selected VPN's server — and only the protocol and port the tunnel
+        itself uses, wherever we know them.
+
+        An address-only rule lets ANY traffic to that host leave around the
+        tunnel while it is down. A VPN server that also serves a website — the
+        normal case for a self-hosted one — would be talked to in the clear,
+        from the real address. An endpoint whose port we could not determine
+        still gets the address-only rule rather than none: a tunnel that cannot
+        connect is the one failure that pushes people to disarm."""
+        groups = {}
+        for ip, proto, port in eps:
+            groups.setdefault((proto, port), []).append(ip)
+        out = []
+        for (proto, port), ips in groups.items():
+            tail = (f"{proto} dport {port} "
+                    if proto in ("udp", "tcp") and valid_port(str(port)) else "")
+            out += self._addr_rules(ips, tail, comment)
+        return out
+
+    @staticmethod
+    def _offtunnel_resolver(ev):
+        """The resolver, if it needs a rule of its own — i.e. when it is NOT
+        reached through a tunnel exit.
+
+        Through the tunnel the exit accept already covers it, and a separate
+        address rule is worse than redundant: it is not tied to an interface,
+        so in the moment a tunnel dies — before the ruleset is rebuilt — it
+        would let lookups for that address leave on the physical NIC."""
+        if not is_literal_ip(ev.resolver):
+            return ""
+        if ev.complete and ev.exit_is_tunnel and ev.dns_link == ev.exit_iface:
+            return ""
+        return ev.resolver
+
+    def _dns_backstop(self, ev):
         """Drop DNS toward anything but the chosen resolver.
 
         Must sit BEFORE the bypass/mgmt/LAN accepts, otherwise those holes are
@@ -1031,6 +1615,7 @@ class Firewall:
         allows. The leak surface is resolved's own upstream query, and that is
         what these rules see."""
         out = []
+        resolver = self._offtunnel_resolver(ev)
         if resolver:
             fam = "ip6" if is_ipv6(resolver) else "ip"
             out += [f'    {fam} daddr {resolver} udp dport 53 accept comment "resolver"',
@@ -1041,14 +1626,12 @@ class Firewall:
 
     # ---- the full fail-closed ruleset ----
     def full(self, ev, p, doh_ips):
-        exits = [ev.exit_iface] if (ev.complete and ev.exit_iface) else []
-        bypass = p["bypass_subnets"].split()
-        if p["allow_lan"]:
+        exits = [ev.exit_iface] if (ev.complete and valid_iface(ev.exit_iface)) else []
+        bypass = subnets_of(p["bypass_subnets"])
+        if truthy(p["allow_lan"]):
             bypass += Net.lan_subnets()
-        if ev.subnets:
-            bypass += ev.subnets
-        mgmt = [s for s in p["mgmt_subnets"].split() if valid_subnet(s)]
-        eps = [e for e in ev.endpoints if valid_endpoint(e) and is_literal_ip(e)]
+        mgmt = subnets_of(p["mgmt_subnets"])
+        hardening = p["hardening"] if p["hardening"] in HARDENING_LEVELS else "strict"
 
         o = [f"table inet {TABLE} {{", "  chain output {",
              f"    type filter hook output priority {PRIO}; policy drop;",
@@ -1066,12 +1649,27 @@ class Firewall:
             o.append(f'    oifname {self._set(exits)} accept comment "exit"')
         # the selected VPN's server, over whatever uplink exists — the handshake
         # has to work before the tunnel it is building exists
-        o += self._addr_rules(eps, "", "vpn endpoint")
-        o += self._addr_rules(doh_ips, "tcp dport 443 ", "doh bootstrap")
-        o += self._dns_backstop(ev.resolver)
+        o += self._endpoint_rules(ev.endpoints, "vpn endpoint")
+        if ev.hostnames and not exits:
+            # The DoH hole exists for one caller (this daemon, root) at one
+            # moment (a hostname endpoint to resolve while nothing carries
+            # traffic). Open to every process all the time, it let anything on
+            # the machine reach these resolvers from the real address while the
+            # switch said "blocking everything".
+            o += self._addr_rules(doh_ips, "tcp dport 443 ", "doh bootstrap",
+                                  head="meta skuid 0 ")
+        o += self._dns_backstop(ev)
         o += self._subnet_rules(bypass, "bypass")
         o += self._subnet_rules(mgmt, "mgmt")
-        o += ['    udp sport 68 udp dport 67 accept comment "dhcp4"',
+        o += [
+              # IPv6 has no ARP: the kernel resolves a next hop with ICMPv6,
+              # and unlike ARP those packets DO pass this hook. Dropped, no
+              # IPv6 neighbour is ever resolved and a VPN whose server is
+              # reached over IPv6 cannot complete its handshake. Link scope
+              # only (hop limit 255) — they cannot leave the segment.
+              "    icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, "
+              'nd-router-solicit } accept comment "l2"',
+              '    udp sport 68 udp dport 67 accept comment "dhcp4"',
               '    udp sport 546 udp dport 547 accept comment "dhcp6"',
               '    counter comment "ks-drop-out"',
               "  }"]
@@ -1080,7 +1678,7 @@ class Firewall:
         o += ["  chain input {",
               f"    type filter hook input priority {PRIO}; policy drop;",
               '    iifname "lo" accept']
-        if p["strict_input"] and exits:
+        if truthy(p["strict_input"]) and exits:
             # off by default: inbound acceptance is not a real-IP egress vector,
             # and scoping it raises the lockout risk on a remote box
             o.append("    ct state established,related iifname %s accept"
@@ -1089,12 +1687,9 @@ class Firewall:
             o.append("    ct state established,related accept")
         if exits:
             o.append(f'    iifname {self._set(exits)} accept comment "exit"')
-        for prt in p["allow_in_ports"].split():
-            if prt.isdigit():
-                o.append(f'    tcp dport {prt} accept comment "mgmt port"')
-        for sn in dict.fromkeys(s for s in mgmt if valid_subnet(s)):
-            fam = "ip6" if is_ipv6(sn) else "ip"
-            o.append(f'    {fam} saddr {sn} accept comment "mgmt"')
+        for prt in ports_of(p["allow_in_ports"]):
+            o.append(f'    tcp dport {prt} accept comment "mgmt port"')
+        o += self._subnet_rules(mgmt, "mgmt", sel="saddr")
         o += ['    udp sport 67 udp dport 68 accept comment "dhcp4"',
               '    udp sport 547 udp dport 546 accept comment "dhcp6"',
               "    icmp type { echo-reply, destination-unreachable, time-exceeded } accept",
@@ -1108,13 +1703,19 @@ class Firewall:
         # ip_forward is 1 on a Bluefin-dx workstation (podman, waydroid, libvirt).
         # Forwarded packets never traverse the output hook, so without this chain
         # a container is a hole straight through the kill switch.
-        if p["hardening"] in ("strict", "paranoid"):
+        if hardening in ("strict", "paranoid"):
             o += ["  chain forward {",
                   f"    type filter hook forward priority {PRIO}; policy drop;"]
             if exits:
                 o += [f'    oifname {self._set(exits)} accept comment "forward via exit"',
                       f'    iifname {self._set(exits)} ct state established,related accept']
             o += self._subnet_rules(bypass, "bypass")
+            # ...and the way back. Without it a guest could SEND to an allowed
+            # network and never hear the answer. Established only, and only
+            # from the allowed network itself, so this cannot carry anything
+            # that was not let out by the rule above.
+            o += self._subnet_rules(bypass, "bypass reply", sel="saddr",
+                                    tail="ct state established,related ")
             o += ['    counter comment "ks-drop-fwd"', "  }"]
         o.append("}")
 
@@ -1140,19 +1741,26 @@ class Firewall:
         """
         if p["hardening"] != "paranoid":
             return []
-        eps = [e for e in ev.endpoints if is_literal_ip(e)]
-        allow = [s for s in p["bypass_subnets"].split() if valid_subnet(s)]
-        allow += [s for s in p["mgmt_subnets"].split() if valid_subnet(s)]
-        if p["allow_lan"]:
+        allow = subnets_of(p["bypass_subnets"]) + subnets_of(p["mgmt_subnets"])
+        if truthy(p["allow_lan"]):
             allow += Net.lan_subnets()
-        if ev.resolver and not ev.exit_is_tunnel:
-            allow.append(ev.resolver + ("/128" if is_ipv6(ev.resolver) else "/32"))
+        resolver = self._offtunnel_resolver(ev)
+        if resolver:
+            allow.append(resolver + ("/128" if is_ipv6(resolver) else "/32"))
+        # a trusted node's uplink IS the permitted exit — filtering it here
+        # would cut the very path we just decided to trust. The hook lives on
+        # the real card, so for a bridged or bonded uplink that means the
+        # card(s) underneath it.
+        open_nics = (Net.physical_under(ev.exit_iface)
+                     if ev.complete and not ev.exit_is_tunnel else set())
 
         o = [f"table netdev {NETDEV_TABLE} {{"]
         for nic in Net.physical_nics():
-            # a trusted node's uplink IS the permitted exit — filtering it here
-            # would cut the very path we just decided to trust
-            if not ev.exit_is_tunnel and nic == ev.exit_iface:
+            if nic in open_nics:
+                continue
+            if not valid_iface(nic):
+                log_once(f"nic:{nic}", f"netdev: cannot name {nic!r} in a ruleset "
+                                       "— that card is covered by the inet layer only")
                 continue
             o += [f"  chain egress_{nft_ident(nic)} {{",
                   f'    type filter hook egress device "{nic}" priority 0; policy drop;',
@@ -1165,19 +1773,28 @@ class Firewall:
                   'nd-router-solicit } accept comment "l2"',
                   '    udp sport 68 udp dport 67 accept comment "dhcp4"',
                   '    udp sport 546 udp dport 547 accept comment "dhcp6"']
-            o += self._addr_rules(eps, "", "encapsulated vpn")
-            o += self._addr_rules(doh_ips, "tcp dport 443 ", "doh bootstrap")
-            o += self._subnet_rules(allow, "allowed", indent="    ")
+            o += self._endpoint_rules(ev.endpoints, "encapsulated vpn")
+            if ev.hostnames and not ev.complete:
+                # no socket owner to match on down here, and none needed:
+                # whatever reaches this hook either passed the inet rule (root
+                # only) or came from a raw socket, which is root already
+                o += self._addr_rules(doh_ips, "tcp dport 443 ", "doh bootstrap")
+            o += self._subnet_rules(allow, "allowed")
             o += ['    counter comment "ks-drop-egress"', "  }"]
         o.append("}")
         return o if len(o) > 2 else []
+
+    @staticmethod
+    def node_dns(ev):
+        addr = str((ev.node or {}).get("dns") or ev.resolver or "")
+        return addr if is_literal_ip(addr) else ""
 
     def node(self, ev, p):
         """Node mode: WAN stays open, DNS is forced to the kiwi-node.
 
         A lightweight "I am on my own network, just stop DNS wandering off"
         mode — not a kill switch, and the status text must never imply it is."""
-        addr = (ev.node or {}).get("dns") or ev.resolver
+        addr = self.node_dns(ev)
         o = [f"table inet {TABLE} {{", "  chain output {",
              f"    type filter hook output priority {PRIO}; policy accept;",
              '    oifname "lo" accept']
@@ -1196,7 +1813,8 @@ class Firewall:
         Deliberately minimal — no endpoints, no bypass, no DNS, mgmt only. The
         parts most likely to have been rejected are gone, so this almost always
         loads, and blocking is the only safe answer at that point."""
-        mgmt = [s for s in (p or {}).get("mgmt_subnets", "").split() if valid_subnet(s)]
+        p = p or {}
+        mgmt = subnets_of(p.get("mgmt_subnets", ""))
         o = [f"table inet {TABLE} {{", "  chain output {",
              f"    type filter hook output priority {PRIO}; policy drop;",
              '    oifname "lo" accept',
@@ -1208,15 +1826,36 @@ class Firewall:
               f"    type filter hook input priority {PRIO}; policy drop;",
               '    iifname "lo" accept',
               "    ct state established,related accept"]
-        for prt in (p or {}).get("allow_in_ports", "").split():
-            if prt.isdigit():
-                o.append(f'    tcp dport {prt} accept comment "mgmt port"')
-        for sn in mgmt:
-            fam = "ip6" if is_ipv6(sn) else "ip"
-            o.append(f'    {fam} saddr {sn} accept comment "mgmt"')
+        for prt in ports_of(p.get("allow_in_ports", "")):
+            o.append(f'    tcp dport {prt} accept comment "mgmt port"')
+        o += self._subnet_rules(mgmt, "mgmt", sel="saddr")
         o += ['    counter comment "ks-drop-in"', "  }", "  chain forward {",
               f"    type filter hook forward priority {PRIO}; policy drop;",
               '    counter comment "ks-drop-fwd"', "  }", "}"]
+        return self._wrap(o, [])
+
+    def lockdown(self):
+        """The last resort: loopback and DHCP, built from no input at all.
+
+        hard_block() still carries the management subnets and ports. Both are
+        sanitised on the way in now — but "the fallback embeds the same value
+        that broke the real ruleset" is exactly how a typo once left an armed
+        machine with no table, so there is one more rung below it that no
+        setting can reach, because it contains none. It will cut a remote
+        session. When this is all that loads, that is the right trade."""
+        o = [f"table inet {TABLE} {{", "  chain output {",
+             f"    type filter hook output priority {PRIO}; policy drop;",
+             '    oifname "lo" accept',
+             '    udp sport 68 udp dport 67 accept comment "dhcp4"',
+             '    counter comment "ks-drop-out"',
+             "  }", "  chain input {",
+             f"    type filter hook input priority {PRIO}; policy drop;",
+             '    iifname "lo" accept',
+             '    udp sport 67 udp dport 68 accept comment "dhcp4"',
+             '    counter comment "ks-drop-in"',
+             "  }", "  chain forward {",
+             f"    type filter hook forward priority {PRIO}; policy drop;",
+             '    counter comment "ks-drop-fwd"', "  }", "}"]
         return self._wrap(o, [])
 
     @staticmethod
@@ -1254,6 +1893,7 @@ class Dns:
 
     def __init__(self, cfg):
         self.cfg = cfg
+        self._applied = None        # what resolved was last pointed at
 
     @property
     def touched(self):
@@ -1276,13 +1916,16 @@ class Dns:
         return out
 
     def apply(self, ev, p):
-        if not (ev.dns_link and ev.resolver):
+        if not (ev.dns_link and is_literal_ip(ev.resolver)):
             # nothing trustworthy to point at: leave resolved alone and let the
             # nft backstop drop the queries. Status says "blocked" rather than
             # pretending DNS works.
             self.clear()
             return
         link = ev.dns_link
+        doms = ["~."] + [d for d in str(p["dns_search"]).split()
+                         if d == "~." or _HOST_RE.match(d.lstrip("~"))]
+        dot = truthy(p["dns_dot"])
         for other in self._links():
             if other == link:
                 continue
@@ -1291,17 +1934,23 @@ class Dns:
             # without rewriting the NetworkManager profile
             run(["resolvectl", "default-route", other, "no"])
             self._mark(other)
+        # The settings are re-asserted every time — NetworkManager pushes its
+        # own view to resolved whenever it likes — but they are idempotent.
         run(["resolvectl", "dns", link, ev.resolver])
-        doms = ["~."] + [d for d in p["dns_search"].split() if d]
         run(["resolvectl", "domain", link] + doms)
         run(["resolvectl", "default-route", link, "yes"])
-        run(["resolvectl", "dnsovertls", link,
-             "yes" if truthy(p["dns_dot"]) else "no"])
+        run(["resolvectl", "dnsovertls", link, "yes" if dot else "no"])
         self._mark(link)
-        run(["resolvectl", "flush-caches"])
-        log(f"dns: {ev.dns_path} via {ev.resolver} on {link}")
+        # The cache is another matter: flushing it throws away every answer
+        # the machine has. Only when the path actually changed.
+        want = (link, ev.resolver, tuple(doms), dot)
+        if want != self._applied:
+            self._applied = want
+            run(["resolvectl", "flush-caches"])
+            log(f"dns: {ev.dns_path} via {ev.resolver} on {link}")
 
     def clear(self):
+        self._applied = None
         if not self.touched:
             return
         for link in sorted(self.touched):
@@ -1338,13 +1987,21 @@ class KillSwitch:
         # `enforcing` is verified reality (our table is really loaded). They
         # differ exactly when something went wrong — which is when the UI must
         # not claim safety.
-        self.status = {"armed": False, "enforcing": False, "mode": "full",
-                       "exit_iface": "", "vpn": "", "dns_path": "blocked",
-                       "hardening": "strict", "node": "", "conflicts": "",
-                       "pending": 0, "detail": "disarmed"}
+        # `state` is the same picture as one word, so three front-ends do not
+        # each have to derive it from the other fields and disagree:
+        #   off | protected | trusted-node | dns-only | blocking | unprotected
+        # mode / vpn / hardening start out as configured, so a daemon that has
+        # only just started already tells the front-ends which connection is
+        # selected instead of showing nothing until the first arm.
+        self.status = {"armed": False, "enforcing": False, "state": "off",
+                       "mode": str(cfg["mode"]), "exit_iface": "",
+                       "vpn": str(cfg["vpn"]), "dns_path": "blocked",
+                       "hardening": str(cfg["hardening"]), "node": "",
+                       "conflicts": "", "pending": 0, "detail": "disarmed"}
         self._lock = threading.Lock()
         self._hard_timer = 0
         self._deadman_timer = 0
+        self._loaded = None         # the exact ruleset text the kernel has
 
     @property
     def mgmt_routes(self):
@@ -1365,55 +2022,99 @@ class KillSwitch:
             self.dns.clear()
 
     # ---- mgmt bypass routing (survives a full tunnel) ----
-    def _add_mgmt_routes(self, p):
-        """Keep admin subnets off the tunnel.
+    @staticmethod
+    def _rule_present(sn):
+        fam = ["-6"] if is_ipv6(sn) else ["-4"]
+        want = ipaddress.ip_network(sn)
+        for ln in run(["ip"] + fam + ["rule", "show"]).stdout.splitlines():
+            pref, _, rest = ln.partition(":")
+            f = rest.split()
+            if pref.strip() != str(MGMT_RULE_PRIO) or "to" not in f[:-1]:
+                continue
+            if "lookup" not in f[:-1] or f[f.index("lookup") + 1] != "main":
+                continue
+            try:
+                if ipaddress.ip_network(f[f.index("to") + 1], strict=False) == want:
+                    return True
+            except ValueError:
+                continue
+        return False
 
-        Only needed when a subnet would otherwise follow a full-tunnel default
-        route. If the kernel already reaches it directly — on-link, or via the
-        physical uplink — we must NOT touch it: forcing an on-link subnet
-        through the gateway breaks return traffic and cuts the very SSH session
-        this is supposed to protect.
+    @staticmethod
+    def _pin_present(rec):
+        for ln in run(["ip", "route", "show", "exact", rec["subnet"]]).stdout.splitlines():
+            f = ln.split()
+            if (f"via {rec['gw']} " in ln + " " and f"dev {rec['dev']} " in ln + " "
+                    and "metric" in f[:-1]
+                    and f[f.index("metric") + 1] == str(MGMT_METRIC)):
+                return True
+        return False
 
-        Routes we added stay ours until the subnet leaves the config, so the
-        check cannot oscillate: once pinned, a subnet no longer looks
-        tunnel-routed, and re-evaluating it would immediately undo the pin."""
-        want = [s for s in p["mgmt_subnets"].split() if valid_subnet(s)]
+    def _sync_mgmt(self, p):
+        """Keep admin subnets off the tunnel — and CHECK, every time, that they
+        still are.
+
+        Every management subnet gets a policy rule ahead of the VPN's. A pinned
+        route as well only when the subnet would otherwise follow a tunnel's
+        routes in `main` AND is not attached: forcing an on-link subnet through
+        the gateway breaks return traffic and cuts the very SSH session this is
+        supposed to protect, and a bridge's own subnet (libvirt, podman) must
+        never be sent out the physical NIC.
+
+        The record says what we OWN, so it can be undone exactly. The kernel
+        says what EXISTS. An earlier revision asked the record both questions,
+        so a rule that had vanished was never put back — and a reboot while
+        armed is enough for that, policy rules do not persist: the machine came
+        up, the VPN took the default route, and the admin LAN went into the
+        tunnel with it.
+
+        A held pin is not re-judged against "is it tunnel-routed": once pinned
+        it no longer is, and asking would undo the pin immediately.
+        """
+        want = subnets_of(p["mgmt_subnets"])
         for rec in list(self.mgmt_routes):
-            if self._route_subnet(rec) not in want:
+            if not isinstance(rec, dict) or rec.get("subnet") not in want:
                 self._del_one_mgmt_route(rec)
         gw, dev = Net.physical_gw()
-        held = {self._route_subnet(r) for r in self.mgmt_routes}
+        changed = False
         for sn in want:
-            if sn in held:
-                continue
-            rec = {"subnet": sn, "rule": False, "gw": "", "dev": ""}
+            rec = next((r for r in self.mgmt_routes if r.get("subnet") == sn), None)
+            fresh = rec is None
+            if fresh:
+                rec = {"subnet": sn, "rule": False, "gw": "", "dev": ""}
+            was = dict(rec)
             fam = ["-6"] if is_ipv6(sn) else ["-4"]
-            # drop any leftover of ours first, so repeated applies cannot stack
-            for _ in range(4):
-                if run(["ip"] + fam + ["rule", "del", "to", sn, "lookup", "main",
-                                       "priority", str(MGMT_RULE_PRIO)]).returncode != 0:
-                    break
-            if run(["ip"] + fam + ["rule", "add", "to", sn, "lookup", "main",
-                                   "priority", str(MGMT_RULE_PRIO)]).returncode == 0:
+
+            if self._rule_present(sn):
+                rec["rule"] = True          # ours by its signature; ours to remove
+            elif run(["ip"] + fam + ["rule", "add", "to", sn, "lookup", "main",
+                                     "priority", str(MGMT_RULE_PRIO)]).returncode == 0:
+                if rec["rule"]:
+                    log(f"mgmt {sn}: the policy rule had vanished — restored")
                 rec["rule"] = True
-            # An ATTACHED network is already reachable over its own interface —
-            # the rule above is all it needs. Routing it through a gateway as
-            # well is how you cut your own LAN, or sever a NAT'd VM from its
-            # host (a bridge has no sysfs device, so it looks like a tunnel).
-            if (not Net.is_onlink(sn) and gw and dev
-                    and Net.routed_via_tunnel(sn)):
+
+            onlink = Net.is_onlink(sn)
+            if rec["gw"] and (onlink or (rec["gw"], rec["dev"]) != (gw, dev)):
+                # the uplink moved, or we are now ON that network
+                run(["ip", "route", "del", sn, "via", rec["gw"], "dev", rec["dev"],
+                     "metric", str(MGMT_METRIC)])
+                rec["gw"], rec["dev"] = "", ""
+            wanted_pin = bool(rec["gw"]) or (not onlink and bool(gw and dev)
+                                             and Net.routed_via_tunnel(sn))
+            if wanted_pin and not (rec["gw"] and self._pin_present(rec)):
                 if run(["ip", "route", "replace", sn, "via", gw, "dev", dev,
                         "metric", str(MGMT_METRIC)]).returncode == 0:
                     rec["gw"], rec["dev"] = gw, dev
-            if rec["rule"] or rec["gw"]:
+                else:
+                    rec["gw"], rec["dev"] = "", ""
+
+            if fresh and (rec["rule"] or rec["gw"]):
                 self.mgmt_routes.append(rec)
-                self.cfg.save()
                 log(f"mgmt {sn}: kept on the local uplink"
                     + (f", pinned via {gw} dev {dev}" if rec["gw"] else ""))
-
-    @staticmethod
-    def _route_subnet(rec):
-        return rec["subnet"] if isinstance(rec, dict) else rec
+            changed = changed or rec != was
+        if changed:
+            self.cfg.save()
 
     def _del_one_mgmt_route(self, rec):
         """Delete only the exact route we installed.
@@ -1431,15 +2132,18 @@ class KillSwitch:
         there is no safe way to delete it — drop the record and leave the route
         alone. A stale pin is untidy; cutting the admin LAN is not.
         """
-        if isinstance(rec, dict):
+        if isinstance(rec, dict) and norm_subnet(str(rec.get("subnet", ""))):
             sn = rec["subnet"]
             fam = ["-6"] if is_ipv6(sn) else ["-4"]
             if rec.get("gw") and rec.get("dev"):
                 run(["ip", "route", "del", sn, "via", rec["gw"],
                      "dev", rec["dev"], "metric", str(MGMT_METRIC)])
             if rec.get("rule"):
-                run(["ip"] + fam + ["rule", "del", "to", sn, "lookup", "main",
-                                    "priority", str(MGMT_RULE_PRIO)])
+                # a rule can be stacked by a crash between add and save
+                for _ in range(4):
+                    if run(["ip"] + fam + ["rule", "del", "to", sn, "lookup", "main",
+                                           "priority", str(MGMT_RULE_PRIO)]).returncode != 0:
+                        break
         else:
             log(f"mgmt route record {rec!r} predates exact deletion — "
                 "dropping the record without touching the routing table")
@@ -1476,7 +2180,7 @@ class KillSwitch:
         # alone.
         if self._hard_timer:
             return
-        secs = max(15, int(self.cfg["hardening_confirm_sec"] or 90))
+        secs = max(15, int_of(self.cfg["hardening_confirm_sec"], 90))
         log(f"paranoid hardening is provisional — confirm within {secs}s")
         self._hard_timer = GLib.timeout_add_seconds(secs, self._watchdog_expired)
 
@@ -1507,10 +2211,7 @@ class KillSwitch:
         the UI says plainly what it does.
         """
         self._cancel_deadman()
-        try:
-            secs = int(self.cfg["deadman_sec"] or 0)
-        except (TypeError, ValueError):
-            secs = 0
+        secs = int_of(self.cfg["deadman_sec"], 0)
         if secs <= 0 or not truthy(self.cfg["developer_mode"]):
             return
         secs = max(30, secs)
@@ -1533,89 +2234,183 @@ class KillSwitch:
         self._notify()
 
     # ---- apply ----
+    def _load(self, text):
+        """Install a ruleset — unless that exact text is what is already loaded.
+
+        Reloading an identical ruleset is not free: it resets every counter,
+        the ks-drop-* ones included, and those are the evidence of what was
+        blocked. Skipped only when the kernel confirms our tables are there."""
+        if text == self._loaded and nft_present(netdev=f"table netdev {NETDEV_TABLE} {{" in text):
+            return True
+        ok = nft_apply(text)
+        self._loaded = text if ok else None
+        return ok
+
+    def _load_fallback(self, p=None):
+        """Something went wrong: block. True if SOME block got loaded."""
+        try:
+            if self._load(self.fw.hard_block(p if p is not None
+                                             else self.cfg.settings())):
+                return True
+        except Exception as e:  # noqa: BLE001 — the rung below needs no input at all
+            log(f"hard block could not be built: {e}")
+        log("hard block rejected too — loading the bare lockdown")
+        return self._load(self.fw.lockdown())
+
+    def _fail_closed(self):
+        """apply() blew up before it could say anything. Block, and say so."""
+        try:
+            self._load_fallback()
+        except Exception as e:  # noqa: BLE001
+            log(f"fallback failed: {e}")
+        enforcing = nft_present()
+        if not enforcing:
+            log("CRITICAL: no ruleset is loaded — traffic is NOT being filtered")
+        self.status.update(
+            armed=True, enforcing=enforcing, exit_iface="", node="",
+            dns_path="blocked", conflicts="", vpn=str(self.cfg["vpn"]),
+            state="blocking" if enforcing else "unprotected",
+            detail=("blocking (internal error — check the journal)" if enforcing
+                    else "NOT PROTECTED — firewall failed, check the journal"))
+
+    @staticmethod
+    def _aux(what, fn, *args):
+        """Run a step that must not be able to take the firewall down with it.
+
+        DNS steering and management routing sit on top of a ruleset that is
+        already loaded. If one of them raises, that is a degraded state — not
+        a reason to throw away a good ruleset for a hard block."""
+        try:
+            fn(*args)
+        except Exception as e:  # noqa: BLE001
+            log(f"{what} step failed — {type(e).__name__}: {e}")
+
     def apply(self):
-        sit = Situation(self.cfg, self.resolver)
-        p = sit.p
-        ev = sit.evaluate()
-        if p["mode"] == "node":
-            return self._apply_node(p, ev)
-        return self._apply_full(p, ev)
+        """Look at the world and enforce it. NEVER raises.
+
+        Anything that goes wrong before a ruleset is loaded ends in a block and
+        a status that says so. This used to be able to raise — one malformed
+        hostname in a connection was enough — and then `armed` was already
+        saved, no table had been loaded, the status still read "disarmed", and
+        the next start crashed on the same input: fail-open, and silent."""
+        try:
+            sit = Situation(self.cfg, self.resolver)
+            ev = sit.evaluate()
+            if sit.p["mode"] == "node":
+                self._apply_node(sit.p, ev)
+            else:
+                self._apply_full(sit.p, ev)
+        except Exception as e:  # noqa: BLE001
+            log(f"apply failed — {type(e).__name__}: {e}")
+            self._fail_closed()
 
     def _apply_full(self, p, ev):
         doh = self.resolver.doh_ips()
-        ok = nft_apply(self.fw.full(ev, p, doh))
+        ok = self._load(self.fw.full(ev, p, doh))
         if not ok:
             # The transaction rolled back — whatever was loaded before is still
-            # loaded, and if that was nothing we are wide open. Retry with the
-            # barest possible ruleset; blocking is the only safe answer here.
+            # loaded, and if that was nothing we are wide open. Blocking is the
+            # only safe answer here.
             log("ruleset rejected — falling back to a hard block")
             ev.complete = False
             ev.exit_iface = ""
-            ok = nft_apply(self.fw.hard_block(p))
+            ev.resolver = ev.dns_link = ""
+            ev.dns_path = "blocked"
+            self._load_fallback(p)
         enforcing = nft_present()
         if not enforcing:
             log("CRITICAL: no ruleset is loaded — traffic is NOT being filtered")
 
-        # keep a current hard block on disk for the pre-network boot unit
-        try:
-            with open(BOOT_RULESET, "w") as fh:
-                fh.write(self.fw.hard_block(p))
-        except OSError as e:
-            log(f"cannot write boot ruleset: {e}")
-
-        self.dns.apply(ev, p)
-        self._add_mgmt_routes(p)
-        self._arm_watchdog(p)
+        self._aux("dns", self.dns.apply, ev, p)
+        self._aux("mgmt", self._sync_mgmt, p)
+        self._aux("watchdog", self._arm_watchdog, p)
 
         if not enforcing:
+            state = "unprotected"
             detail = "NOT PROTECTED — firewall failed, check the journal"
         elif not ok:
+            state = "blocking"
             detail = "blocking (firewall error — check the journal)"
+        elif self.cfg.unreadable:
+            state = "blocking"
+            detail = ("blocking — the saved configuration could not be read, "
+                      "so nothing is permitted. Disarm to start from defaults.")
         elif ev.stale_conn:
+            state = "blocking"
             detail = (f"blocking — NetworkManager still shows '{ev.stale_conn}' "
                       "as connected, but its tunnel interface is down")
         elif not ev.complete:
+            state = "blocking"
             detail = "blocking (no permitted path — is the VPN up?)"
         elif not ev.exit_is_tunnel:
+            state = "trusted-node"
             detail = f"trusted node {ev.node.get('name', '')}"
             if ev.node_not_preferred:
+                state = "blocking"
                 detail += (" — but the system is routing through another uplink, "
                            "so traffic is blocked. Disconnect that uplink, or "
                            f"give {ev.exit_iface} priority in GNOME Settings.")
         else:
+            state = "protected"
             detail = f"protected via {ev.exit_iface}"
         if ev.conflicts and ev.complete:
             detail += f" — conflicting tunnel: {', '.join(ev.conflicts)}"
 
-        self.status.update(armed=True, enforcing=enforcing, mode="full",
-                           exit_iface=ev.exit_iface, vpn=p["vpn"],
+        self.status.update(armed=True, enforcing=enforcing, state=state,
+                           mode="full", exit_iface=ev.exit_iface, vpn=p["vpn"],
                            dns_path=ev.dns_path, hardening=p["hardening"],
                            node=(ev.node or {}).get("name", ""),
                            conflicts=" ".join(ev.conflicts), detail=detail)
-        log(f"applied full: vpn={p['vpn'] or '(none)'} "
-            f"exit={ev.exit_iface or 'blocked'} dns={ev.dns_path} "
-            f"hardening={p['hardening']} enforcing={enforcing}")
+        line = (f"applied full: vpn={p['vpn'] or '(none)'} "
+                f"exit={ev.exit_iface or 'blocked'} dns={ev.dns_path} "
+                f"hardening={p['hardening']} enforcing={enforcing}")
+        self._log_change(line)
 
     def _apply_node(self, p, ev):
-        nft_apply(self.fw.node(ev, p))
+        ok = self._load(self.fw.node(ev, p))
+        if not ok:
+            log("node ruleset rejected — falling back to a hard block")
+            ev.resolver = ev.dns_link = ""
+            ev.dns_path = "blocked"
+            self._load_fallback(p)
         enforcing = nft_present()
-        self.dns.apply(ev, p)
+        self._aux("dns", self.dns.apply, ev, p)
         self._cancel_watchdog()
-        self.status.update(armed=True, enforcing=enforcing, mode="node",
-                           exit_iface="", vpn=p["vpn"], dns_path=ev.dns_path,
-                           hardening=p["hardening"],
+        addr = self.fw.node_dns(ev)
+        if not enforcing:
+            state, detail = "unprotected", "NOT PROTECTED — firewall failed, check the journal"
+        elif not ok:
+            state, detail = "blocking", "blocking (firewall error — check the journal)"
+        elif addr:
+            state = "dns-only"
+            detail = f"DNS only: lookups forced to {addr}, internet open"
+        else:
+            # say it: with no node to send them to, the drop rules stand alone
+            state = "dns-only"
+            detail = ("DNS only: no trusted node on this network, so lookups "
+                      "are blocked — internet open")
+        self.status.update(armed=True, enforcing=enforcing, state=state,
+                           mode="node", exit_iface="", vpn=p["vpn"],
+                           dns_path=ev.dns_path, hardening=p["hardening"],
                            node=(ev.node or {}).get("name", ""),
-                           conflicts=" ".join(ev.conflicts),
-                           detail=("NOT PROTECTED — firewall failed" if not enforcing
-                                   else "node mode: WAN open, DNS forced to the node"))
-        log(f"applied node: dns={ev.dns_path} enforcing={enforcing}")
+                           conflicts=" ".join(ev.conflicts), detail=detail)
+        self._log_change(f"applied node: dns={ev.dns_path} enforcing={enforcing}")
+
+    def _log_change(self, line):
+        """One journal line per CHANGE of outcome, not one per apply — apply
+        runs on every network event and a periodic safety pass."""
+        if line != getattr(self, "_last_line", None):
+            self._last_line = line
+            log(line)
 
     # ---- public ops ----
     def arm(self, vpn=None):
         if vpn:
             # picking a connection from the Quick Settings menu both selects
-            # and enforces it — a complete action, not a staged one
+            # and enforces it — a complete action, not a staged one, and it
+            # supersedes a pick that was staged and never applied
             self.cfg["vpn"] = vpn
+            self.cfg["pending"].pop("vpn", None)
         self.cfg["armed"] = True
         self.cfg.save()
         with self._lock:
@@ -1627,24 +2422,32 @@ class KillSwitch:
         self._cancel_watchdog()
         self._cancel_deadman()
         nft_drop_tables()
+        self._loaded = None
+        self._last_line = None
         self.cfg["armed"] = False
+        self.cfg.unreadable = False
         self.cfg.save()
-        self.dns.clear()
-        self._del_mgmt_routes()
+        self._aux("dns", self.dns.clear)
+        self._aux("mgmt", self._del_mgmt_routes)
         # clear the whole picture, not just `armed` — leaving the last-applied
         # mode/hardening/vpn behind makes a disarmed daemon look like it is
         # still enforcing something
-        self.status.update(armed=False, enforcing=False, exit_iface="",
-                           dns_path="system", node="", conflicts="",
-                           mode=self.cfg["mode"], vpn=self.cfg["vpn"],
+        self.status.update(armed=False, enforcing=False, state="off",
+                           exit_iface="", dns_path="system", node="",
+                           conflicts="", mode=self.cfg["mode"],
+                           vpn=self.cfg["vpn"],
                            hardening=self.cfg["hardening"], detail="disarmed")
         self._notify()
 
     def sync(self):
+        """Re-evaluate. Tells the front-ends only if the answer changed — they
+        each re-read everything on a signal, and most syncs change nothing."""
         if self.cfg["armed"]:
+            before = dict(self.status)
             with self._lock:
                 self.apply()
-            self._notify()
+            if self.status != before:
+                self._notify()
 
     def restore(self):
         if self.cfg["armed"]:
@@ -1660,15 +2463,27 @@ class KillSwitch:
 
 # ---------------------------------------------------------------------------
 class Debounced:
-    """Collapse a burst of events into one call, ~1.2s after the last one."""
+    """Collapse a burst of events into one call, ~1.2s after the last one —
+    but no later than DEBOUNCE_MAX_MS after the first, so a link that flaps
+    without pause cannot postpone the sync for ever.
+
+    One instance is shared by both watchers: a VPN coming up makes
+    NetworkManager and the kernel report within the same second, and two
+    timers meant two full applies for one event."""
 
     def __init__(self, on_event):
         self.on_event = on_event
         self._pending = 0
+        self._first = 0.0
 
-    def _changed(self, *_):
+    def poke(self, *_):
+        now = time.monotonic()
         if self._pending:
+            if (now - self._first) * 1000 >= DEBOUNCE_MAX_MS:
+                return                    # let the running timer fire
             GLib.source_remove(self._pending)
+        else:
+            self._first = now
         self._pending = GLib.timeout_add(DEBOUNCE_MS, self._fire)
 
     def _fire(self):
@@ -1680,17 +2495,17 @@ class Debounced:
         return False
 
 
-class NMMonitor(Debounced):
+class NMMonitor:
     """React to NetworkManager state changes in real time (debounced)."""
 
-    def __init__(self, bus, on_event):
-        super().__init__(on_event)
+    def __init__(self, bus, poke):
         for sig in ("StateChanged", "DeviceAdded", "DeviceRemoved"):
             bus.signal_subscribe("org.freedesktop.NetworkManager", None, sig,
-                                 None, None, Gio.DBusSignalFlags.NONE, self._changed)
+                                 None, None, Gio.DBusSignalFlags.NONE,
+                                 lambda *_: poke())
 
 
-class LinkMonitor(Debounced):
+class LinkMonitor:
     """React to kernel link/address/route changes.
 
     INVARIANT 3. NetworkManager events are NOT enough: a tunnel that dies at the
@@ -1706,9 +2521,10 @@ class LinkMonitor(Debounced):
     Do not remove this again.
     """
 
-    def __init__(self, on_event):
-        super().__init__(on_event)
+    def __init__(self, poke):
+        self.poke = poke
         self._proc = None
+        self._queued = False
         self._start()
 
     def _start(self):
@@ -1719,38 +2535,42 @@ class LinkMonitor(Debounced):
         except OSError as e:
             log(f"ip monitor unavailable ({e}) — reconcile loop only")
             return False
-        stream = Gio.DataInputStream.new(
-            Gio.UnixInputStream.new(self._proc.stdout.fileno(), False))
-        self._read(stream)
+        # A plain reader thread: all we need from the pipe is "something
+        # happened", and this keeps us off the GLib/Gio fd wrappers PyGObject
+        # keeps deprecating — a daemon that fails to start on the next
+        # PyGObject is a machine stuck on the boot-time hard block.
+        threading.Thread(target=self._reader, args=(self._proc,),
+                         daemon=True).start()
         return False
 
-    def _read(self, stream):
-        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_line)
+    def _reader(self, proc):
+        for _line in proc.stdout:
+            if not self._queued:              # one wake-up per burst is enough
+                self._queued = True
+                GLib.idle_add(self._deliver)
+        proc.wait()
+        GLib.idle_add(self._died)
 
-    def _on_line(self, stream, res):
-        try:
-            line, _ = stream.read_line_finish(res)
-        except GLib.Error as e:
-            log(f"ip monitor read error: {e}")
-            line = None
-        if line is None:                      # monitor died — never go deaf
-            log("ip monitor ended — restarting in 2s")
-            GLib.timeout_add_seconds(2, self._start)
-            return
-        self._changed()
-        self._read(stream)
+    def _deliver(self):
+        self._queued = False
+        self.poke()
+        return False
+
+    def _died(self):                          # monitor died — never go deaf
+        log("ip monitor ended — restarting in 2s")
+        GLib.timeout_add_seconds(2, self._start)
+        return False
 
 
 # ---------------------------------------------------------------------------
 class Service:
-    NODE_KEYS = ("name", "ip", "mac", "dns")
-
     def __init__(self):
         self.cfg = Config()
         self.ks = KillSwitch(self.cfg, self._emit_changed)
         self.conn = None
         self.reg_id = 0
         self._fp = ""
+        self._last_sync = time.monotonic()
 
     # ---- lifecycle ----
     def start(self):
@@ -1763,14 +2583,20 @@ class Service:
         # path". With this order the object is always there by the time anyone
         # can find us.
         self.conn = self.bus
-        self.reg_id = self.bus.register_object(
-            OBJ_PATH, self.node_info.interfaces[0], self._handle, None, None)
+        register = (getattr(self.bus, "register_object_with_closures2", None)
+                    or self.bus.register_object)
+        self.reg_id = register(OBJ_PATH, self.node_info.interfaces[0],
+                               self._handle, None, None)
         Gio.bus_own_name_on_connection(self.bus, BUS_NAME,
                                        Gio.BusNameOwnerFlags.NONE,
                                        self._on_acquired, None)
-        self.monitor = NMMonitor(self.bus, self._on_event)
-        # the kernel is the authority on whether a tunnel is actually alive
-        self.links = LinkMonitor(self._on_event)
+        self.debounce = Debounced(self._on_event)
+        try:
+            self.monitor = NMMonitor(self.bus, self.debounce.poke)
+            # the kernel is the authority on whether a tunnel is actually alive
+            self.links = LinkMonitor(self.debounce.poke)
+        except Exception as e:  # noqa: BLE001 — a deaf daemon still has the tick
+            log(f"event monitors failed to start ({e}) — reconcile loop only")
         GLib.timeout_add_seconds(RECONCILE_SEC, self._reconcile)
         if not self.cfg["armed"]:
             self.ks.cleanup_orphans()
@@ -1781,31 +2607,38 @@ class Service:
 
     def _on_event(self):
         self._fp = Net.fingerprint()          # we are acting on this state now
+        self._last_sync = time.monotonic()
         if self.cfg["armed"]:
             self.ks.sync()
 
     def _reconcile(self):
         """Belt and braces: re-assert a vanished ruleset, and catch network
         drift both watchers missed. Compares a cheap snapshot instead of
-        re-applying blindly, so an idle armed machine costs one `ip` call every
-        RECONCILE_SEC and no nft churn at all."""
+        re-applying blindly, so an idle armed machine costs a few `ip` calls
+        every RECONCILE_SEC and no nft churn at all.
+
+        Once every RESYNC_SEC it re-evaluates regardless, for the things no
+        snapshot shows: an endpoint edited in NetworkManager, a server that
+        roamed, a gateway whose MAC changed, a resolver setting NM pushed back.
+        That pass is quiet — it reloads nothing and signals nobody unless the
+        answer came out different."""
         try:
+            if not self.cfg["armed"]:
+                return True
             # INVARIANT 7. The table can vanish under us at any moment — a stray
             # `nft flush ruleset`, another admin, a tool that owns the ruleset.
             # Until this check existed, `enforcing` was computed only at apply
             # time, so the daemon would report "protected" forever while the
             # machine ran naked.
-            if self.cfg["armed"] and not nft_present():
+            if not nft_present():
                 log("reconcile: our ruleset is GONE — re-asserting immediately")
-                self.ks.sync()
-                self._fp = Net.fingerprint()
-                return True
-            fp = Net.fingerprint()
-            if fp != self._fp:
-                self._fp = fp
-                if self.cfg["armed"]:
-                    log("reconcile: network drifted without an event — re-syncing")
-                    self._on_event()
+                self._on_event()
+                self._emit_changed()
+            elif Net.fingerprint() != self._fp:
+                log("reconcile: network drifted without an event — re-syncing")
+                self._on_event()
+            elif time.monotonic() - self._last_sync >= RESYNC_SEC:
+                self._on_event()
         except Exception as e:  # noqa: BLE001
             log(f"reconcile error: {e}")
         return True                           # keep the timer alive
@@ -1830,7 +2663,7 @@ class Service:
     def _dispatch(self, method, params):
         cfg = self.cfg
         if method == "Arm":
-            self.ks.arm(params.unpack()[0] or None)
+            self.ks.arm(clean_setting("vpn", params.unpack()[0]) or None)
             return None
         if method == "Disarm":
             self.ks.disarm()
@@ -1856,6 +2689,7 @@ class Service:
             if s.get("armed"):
                 s["enforcing"] = nft_present()
                 if not s["enforcing"]:
+                    s["state"] = "unprotected"
                     s["detail"] = "NOT PROTECTED — ruleset missing, re-asserting"
             s["pending"] = len(cfg["pending"])
             var = {}
@@ -1874,7 +2708,7 @@ class Service:
         if method == "SetPending":
             key, val = params.unpack()
             cfg.set_pending(key, val)
-            if cfg["instant_apply"]:
+            if truthy(cfg["instant_apply"]):
                 if cfg.promote() and cfg["armed"]:
                     self.ks.sync()
             self._emit_changed()
@@ -1882,19 +2716,13 @@ class Service:
         if method == "ListVpns":
             return GLib.Variant("(a(sss))", (Net.all_vpns(),))
         if method == "ListNodes":
-            nodes = [{k: str(n.get(k, "")) for k in self.NODE_KEYS}
+            nodes = [{k: str(n.get(k, "")) for k in ("name", "ip", "mac", "dns")}
                      for n in cfg["nodes"]]
             return GLib.Variant("(aa{ss})", (nodes,))
         if method == "WriteNode":
-            node = params.unpack()[0]
-            name = (node.get("name") or "").strip()
-            if not name:
-                raise ValueError("node name required")
-            if node.get("ip") and not is_literal_ip(node["ip"]):
-                raise ValueError(f"not an IP address: {node['ip']}")
-            entry = {k: str(node.get(k, "")).strip() for k in self.NODE_KEYS}
-            entry["mac"] = entry["mac"].lower()
-            cfg["nodes"] = [n for n in cfg["nodes"] if n.get("name") != name] + [entry]
+            entry = clean_node(params.unpack()[0])
+            cfg["nodes"] = [n for n in cfg["nodes"]
+                            if n.get("name") != entry["name"]] + [entry]
             cfg.save()
             if cfg["armed"]:
                 self.ks.sync()
@@ -1920,21 +2748,26 @@ def restore_only():
     there is no window between a NIC gaining carrier and the daemon getting
     around to loading a ruleset. The full daemon replaces this with the real
     ruleset a moment later.
+
+    The block is always built fresh from the config: /run does not survive a
+    reboot, so there is never a saved one to reuse. And it tries twice — a
+    hard block that keeps the management path, then the bare lockdown — because
+    "the boot block failed to load" used to mean the network came up open.
     """
     cfg = Config()
     if not cfg["armed"]:
         return 0
-    text = ""
-    try:
-        with open(BOOT_RULESET) as fh:
-            text = fh.read()
-    except OSError:
-        pass
-    if not text:
-        text = Firewall(cfg).hard_block(cfg.settings())
-    ok = nft_apply(text, path=BOOT_RULESET)
-    log("boot: hard block loaded" if ok else "boot: FAILED to load the hard block")
-    return 0 if ok else 1
+    fw = Firewall(cfg)
+    for name, build in (("hard block", lambda: fw.hard_block(cfg.settings())),
+                        ("bare lockdown", fw.lockdown)):
+        try:
+            if nft_apply(build(), path=BOOT_RULESET):
+                log(f"boot: {name} loaded")
+                return 0
+        except Exception as e:  # noqa: BLE001
+            log(f"boot: {name} could not be built: {e}")
+    log("boot: FAILED to load any block — the network will come up unfiltered")
+    return 1
 
 
 def panic():
@@ -1949,7 +2782,7 @@ def panic():
     Root only, and it genuinely removes your protection. That is the point.
     """
     log("PANIC: removing all kill switch state")
-    run(["systemctl", "stop", "kiwi-killswitchd.service"])
+    run(["systemctl", "stop", "kiwi-killswitchd.service"], timeout=60)
     nft_drop_tables()
     cfg = Config()
     ks = KillSwitch(cfg, None)
@@ -1959,9 +2792,10 @@ def panic():
     except Exception as e:  # noqa: BLE001 — never let cleanup stop the teardown
         log(f"panic: cleanup error (continuing): {e}")
     cfg["armed"] = False
+    cfg.unreadable = False
     cfg.save()
     nft_drop_tables()
-    run(["systemctl", "start", "kiwi-killswitchd.service"])
+    run(["systemctl", "start", "kiwi-killswitchd.service"], timeout=60)
     log("PANIC: done — this machine is NOT protected")
     return 0
 

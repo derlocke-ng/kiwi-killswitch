@@ -37,10 +37,13 @@ firewall. So enforcement lives in the daemon, and the UI only asks.
   (trusted kiwi-nodes only), or a resolver you pick — applied through
   systemd-resolved's per-link settings, with an nftables backstop that drops every other
   lookup.
-- **Endpoint lookup that works while armed.** A VPN whose server is a hostname has to be
-  resolved before the tunnel exists, when normal DNS is blocked. The daemon queries a
-  configured **DNS-over-HTTPS** server directly, at a pinned IP the ruleset permits, and
-  caches every answer.
+- **Hostname endpoints are pinned, not trusted to DNS.** A VPN whose server is a hostname
+  never gets that name into the ruleset. The daemon resolves it itself over
+  **DNS-over-HTTPS**, to a pinned IP with a verified certificate, and caches every
+  answer. (The VPN client still has to resolve the name too — see *Known limits*.)
+- **Bad input cannot take the firewall down.** Every value is checked when you set it
+  and again when it is written into a ruleset; if a ruleset is rejected anyway, a hard
+  block loads, and below that a lockdown no setting can break.
 - **Pick a connection, then Apply.** The front page lists your VPN connections; tick
   the one to protect. Changes are staged, so you can reconfigure from "home LAN +
   kiwi-node" to "tethering + VPN" *while already on tethering* and then hit Apply —
@@ -68,11 +71,11 @@ sudo ./install.sh install     # root daemon, CLI, bus policy, systemd units
 Log out and back in so GNOME loads the extension. Your user must be in `wheel` — that is
 what the bus policy authorizes.
 
-Via [kiwi-updater](https://github.com/derlocke-ng/kiwi-updater), once it exists:
-`kiwi install kiwi-killswitch` (listed twice: user scope and `scope=system`).
+Via [kiwi-updater](https://github.com/derlocke-ng/kiwi-updater):
+`kiwi install kiwi-killswitch` — it installs both halves.
 
 Uninstall with `sudo ./install.sh uninstall` — it disarms first, so it cannot leave you
-locked out.
+locked out. Add `--purge` to drop the saved settings too.
 
 ## Use
 
@@ -166,12 +169,41 @@ daemon re-asserts them within seconds.
 Do **not** run this alongside another kill switch (`nova-killswitch`, `nova-vpn`). Two
 processes owning an output-drop table will fight.
 
+Leave **`nftables.service`** alone if you are not using it. Fedora's unit runs
+`nft flush ruleset` whenever it stops, which removes every table on the machine —
+ours and firewalld's. The daemon notices and reloads within seconds, but there is no
+reason to open that window.
+
+## Known limits
+
+- **A VPN with a hostname endpoint cannot reconnect while armed**, unless DNS is set to
+  *A resolver I choose*. The kill switch permits the server's address, but
+  NetworkManager and OpenVPN look the name up themselves through the system resolver,
+  which is blocked while no tunnel is up. Connections with a literal IP are unaffected.
+- **A resolver you choose is reachable outside the tunnel** while the tunnel is down —
+  that is what the point above relies on. Turn on DNS-over-TLS for it.
+- **A trusted node saved without a MAC** is matched on its gateway address alone, and
+  any network that hands out that address opens the switch.
+- **Allow the local network** means private address ranges only. A network that calls a
+  public range "local" is not believed; add it under always-allowed destinations if
+  you really mean it.
+
+## Tests
+
+```bash
+tests/run.sh          # no root, changes nothing: every group runs in its own namespace
+```
+
+It loads the real daemon and exercises it with real nftables and real routing. Run it
+after any change, then follow [docs/RUNBOOK.md](docs/RUNBOOK.md) on hardware.
+
 ## Security notes
 
 - Passwordless control is the D-Bus **bus policy** for group `wheel`
   ([data/dbus](data/dbus/eu.kiwinetwork.KillSwitch.conf)) — not a pkexec rule, and not
   sudoers. The daemon exposes a fixed set of validated methods, never "run this as root".
-  Don't loosen it.
+  Don't loosen it. It also means any program running as you can turn the switch off
+  without asking — that is the price of never being prompted.
 - **Trusted-node MAC binding** raises the bar against a hostile network handing out your
   router's IP. It does not stop an attacker already on the wire from forging a MAC.
   A deliberate tradeoff.

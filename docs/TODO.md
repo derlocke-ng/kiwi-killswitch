@@ -5,6 +5,152 @@ as the code.
 
 ## Done
 
+### 2026-10-05 — a review pass, and what it found
+
+A full read of the code, checked against the journals of two machines that had
+been running 0.1.0, then against the test box and an isolated lab. Every item
+was reproduced before it was fixed and re-tested after. The lab is now in the
+repo — `tests/run.sh`, 188 checks, no root — because the earlier harnesses lived
+in a scratch directory and were gone when they were needed.
+
+**Armed, with nothing blocking**
+
+1. **A typo in a setting removed the firewall.** `allow_in_ports = "22 99999"`,
+   or a netmask-style subnet, passed our checks (`"99999".isdigit()`,
+   `ipaddress` accepting `/255.255.0.0`), was rejected by nft — and so was the
+   hard-block fallback, which embedded the same value. On the test box:
+   `armed=true, enforcing=false`, traffic flowing, the CLI printing "armed". The
+   boot unit failed the same way. Values are now validated when set and
+   sanitised again when emitted, and below the hard block there is a lockdown
+   built from no setting at all.
+2. **Any exception inside `apply()` left `armed` saved, no table, and status
+   reading "disarmed"** — then crashed the daemon on its next start. One
+   malformed endpoint hostname did it (`getaddrinfo` raises `UnicodeError`, not
+   `OSError`). `apply()` no longer raises; it ends in a block and says so.
+3. **An unreadable `config.json` booted unprotected, silently.** A file that
+   failed to parse was treated as "no config". It now falls back to the last
+   good copy, and without one the machine is treated as armed. Saves are
+   fsynced.
+4. **Our own unit pulled in a service that flushes the ruleset.**
+   `Wants=nftables.service` started Fedora's unit on machines that had it
+   disabled; its stop action is `nft flush ruleset`. Both machines' journals
+   showed the order at shutdown: NetworkManager, our daemon, then the flush.
+5. **A bridge, bond or VLAN uplink could become the "tunnel".** `is_tunnel()`
+   meant "no sysfs device", which is true of all three. Tunnels are now
+   identified positively, and uplinks are their own class.
+
+**Holes wider than they needed to be**
+
+6. **The DoH exception was open to every process, always** — even with only
+   literal-IP endpoints, where DoH is never used. An ordinary user's
+   `curl https://1.1.1.1/dns-query` was answered from the real address while the
+   switch said "blocking everything". Now: root only, and only while a hostname
+   endpoint needs resolving with no tunnel up.
+7. **The endpoint rule was address-only**, so anything to the VPN server's
+   address left around a dead tunnel. Now limited to the tunnel's protocol and
+   port, parsed from the connection (WireGuard, OpenVPN incl. per-remote ports
+   and proxies), with the address-only rule as the fallback when unknown.
+8. **DoH certificates were not verified, on a premise that was false.** The
+   public resolvers carry IP SANs; verification works against the bare address.
+   The "cross-check against the cache" the old comment described never existed.
+9. **`allow_lan` believed the network about what the LAN is.** A `/1` lease
+   became `ip daddr 0.0.0.0/1 accept`. Private ranges only now.
+10. **The resolver had an interface-less accept rule even when it was reached
+    through the tunnel**, and the tunnel's own subnets were accepted on *any*
+    interface (for OpenVPN that included `fe80::/64`). Both gone.
+
+**Lockouts, and things that could not work**
+
+11. **The management rule was never restored once it was gone** — the daemon
+    asked its saved record whether the rule existed. A reboot while armed was
+    enough to lose it; with a full tunnel that cut SSH. Now checked against the
+    kernel on every apply, the off-link pin included.
+12. **IPv6 endpoints were unreachable**: the output chain dropped neighbour
+    discovery, so no IPv6 next hop could be resolved.
+13. **A MAC-bound node could not be recognised behind our own block**: the MAC
+    was learned by pinging the gateway, and the block dropped the ping. One raw
+    ARP request now.
+14. **Guests could send to an allowed LAN and never hear back** at `strict`:
+    the forward chain had no rule for the replies.
+
+**Trust boundary**
+
+15. **`WriteNode` put the node's resolver into the ruleset as typed.** With a
+    newline in it, any `wheel` process could write arbitrary nft statements as
+    root, and with `include` read root-only files through the journal. Interface
+    names were also written between quotes unchecked.
+
+**Churn**
+
+16. **A full re-apply every 15 seconds on any DHCP machine.** The reconcile
+    snapshot included the lease countdown. 145 of the test box's 392 logged
+    applies were this. Each one reset the drop counters, flushed the resolver
+    cache and signalled the front-ends — and the Shell extension answered every
+    signal with two *synchronous* D-Bus calls inside the compositor. The
+    snapshot ignores lifetimes; an apply that changes nothing reloads nothing,
+    flushes nothing and signals nobody; the extension is fully asynchronous.
+
+**What the UI said**
+
+17. **Node mode was shown as a green "Protected"** in the app and with the
+    closed padlock in the extension, although the internet is open in that mode
+    — and with no node on the network it also blocked all lookups while saying
+    "DNS forced to the node". Status now carries one word, `state`, that all
+    three front-ends switch on, and node mode says what it is.
+18. **`kiwi-killswitch arm` printed "armed" and exited 0 when nothing was
+    enforced.** It reports the outcome and fails when there is none.
+19. **OpenVPN conflicted with itself.** With a plugin VPN up, NetworkManager
+    lists two active entries: the connection (`riseup-ovpn`, type vpn, on the
+    uplink) and a generated one for its tun device (`tun0`, type tun). The
+    second was reported as `conflicting tunnel: tun0` — on the connection it
+    belongs to — and offered in the list as something to tick. Found the first
+    time OpenVPN was actually the protected connection end to end. A tun that
+    no active VPN owns still counts. The same pass fixed connection names
+    containing a colon, which `nmcli -t` escapes and we split in the wrong
+    place.
+20. **The toggle did not notice the daemon stopping or coming back** — an
+    update restarts it — and went on showing its last answer. It watches the
+    bus name now.
+
+For kiwi-updater 2.0.0: `install.sh uninstall --purge` (`KIWI_PURGE=1`) removes
+the saved settings as well, and an uninstall that finds the daemon dead runs its
+panic path first, so resolver overrides and management rules do not outlive it.
+
+Also: `Restart=always` (a lost bus connection ends the process with SIGTERM,
+which `on-failure` treats as clean); the selected connection is reported while
+disarmed; stale "profile" wording removed; three unused helpers removed; the
+PyGObject deprecation warnings at start are gone.
+
+Re-verified on the test box (Bluefin 44) with the new build: 50 s armed and idle
+— zero applies, zero signals, counters intact; the management rule deleted by
+hand and restored on the next sync; DoH and the VPN server's other ports
+unreachable while blocking; bad values refused at `set`; WireGuard up while
+armed with the narrowed endpoint rule, traffic through the tunnel, killed at the
+link level, back; **a reboot while armed** — block 140 ms before NetworkManager,
+management rule restored, MAC-bound node recognised, `nftables.service` no
+longer started.
+
+Then, with a renewed RiseupVPN certificate: **OpenVPN as the protected
+connection, end to end** — armed first, connected over TCP/1194 through the
+per-port endpoint rule (`Initialization Sequence Completed`), `protected via
+tun0`, exit address in France, lookups through the tunnel's resolver, the admin
+LAN still on the uplink; `tun0` taken down at the link level → blocking, named
+as an NM/kernel disagreement, control request dropped. `--panic` run while
+armed left a clean, disarmed machine. `uninstall --purge` while armed, invoked
+with kiwi's environment, left nothing behind and DNS working; reinstall and a
+restored config came back armed.
+
+The extension **loads and runs in GNOME Shell 50.3** (state ACTIVE, no JS errors
+in the session journal) and its code was driven under gjs against the live
+daemon through arm, disarm and a daemon restart.
+
+Not verified, and why:
+
+- **The extension and the settings app by eye.** They run; nobody has looked at
+  the toggle in a panel or clicked through the app since the changes.
+- **The settings app by hand.** `tests/run.sh gui` builds the real window on a
+  headless display for every state the daemon can report, and every page.
+
 ### 2026-10-01 — the settings app, redesigned
 
 The connection list is now the front page: one checkable row per VPN with a
@@ -216,27 +362,39 @@ means what it says and the settings app greys out the picker while it is on.
       assumed: `github.com/derlocke-ng/kiwi-killswitch`,
       `eu.kiwinetwork.KillSwitch`, extension `kiwi-killswitch@kiwi-network.eu`.
 - [ ] Click through the GTK app and the GNOME extension in a real desktop
-      session. Every page is built and walked automatically against a live
-      daemon (`gui_render_test.py`), and the extension loads under gjs with
-      stubbed shell modules, but neither has been driven by hand.
+      session. Every page is built automatically (`tests/run.sh gui`) and the
+      extension has been driven under gjs with stubbed shell modules, but
+      neither has been driven by hand.
+- [ ] **Make a hostname endpoint usable while armed.** The daemon already has
+      the verified answer; the missing half is getting it to the VPN client,
+      which asks the system resolver. Candidate: a managed, clearly marked block
+      in `/etc/hosts`, written while armed and removed on disarm. It touches a
+      system file, so it wants a decision, not a drive-by.
+- [ ] Decide whether the deadman should also arm on `Apply`, and whether it
+      should survive a daemon restart. Today it covers `arm` only and is lost
+      on restart.
 - [ ] Test with a genuine second physical NIC (the macvlan test is a good proxy,
       not the real thing) — ideally wifi + ethernet, or a USB tether.
 - [ ] Test a kiwi-node that actually is the default gateway and does tunnel
       (the node's gateway address / .251), rather than the LAN router standing in for one.
-- [ ] Exercise the DoH resolver against a VPN whose endpoint is a hostname. Both
-      test connections use literal IPs, so that path is unit-tested but has not
-      run against a real hostname endpoint while armed.
-- [ ] IPv6: the rulesets are `inet` and cover it, but the test LAN is v4-only, so
-      the v6 paths are untested in practice.
-- [ ] `kiwi-updater` + `kiwi-catalog` (phase 2), then list this app twice
-      (user + `scope=system`).
+- [ ] Exercise the DoH resolver against a real hostname endpoint. Certificate
+      verification against 1.1.1.1, 9.9.9.9 and 8.8.8.8 was checked from the
+      test box; the lookup itself has still only run against fakes.
+- [ ] IPv6 on a real network. The lab covers an IPv6 endpoint over a veth
+      (handshake, neighbour discovery); the test LAN is v4-only.
 
 ## Known limits
 
 - Paranoid mode ties the netdev chain to NICs that exist at apply time. A NIC
   appearing later is covered by the inet layer until `LinkMonitor` rebuilds.
 - Trusted-node MAC binding does not stop an on-link attacker forging a MAC.
-- DoH certificate hostname verification is disabled for endpoint lookup, because
-  the server is an IP literal. Scoped to that one request.
+- A VPN with a **hostname endpoint cannot reconnect while armed** unless
+  `dns_mode=custom`: we permit the address, but the client resolves the name
+  through the system resolver, which is blocked while no tunnel is up.
+- `dns_mode=custom` reaches its resolver **outside the tunnel** while the tunnel
+  is down. Deliberate — see the point above — and worth DoT.
+- A trusted node saved **without a MAC** is matched on its gateway address alone.
+- Any `wheel` process can disarm without a password. That is what "no prompt,
+  ever" means; the bus policy is the boundary.
 - Node mode (`mode=node`) is not leak protection and the UI says so.
 - Two enforcers fight. Do not run this alongside `nova-killswitch` / `nova-vpn`.

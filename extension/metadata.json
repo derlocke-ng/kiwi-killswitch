@@ -1,7 +1,7 @@
 {
     "uuid": "kiwi-killswitch@kiwi-network.eu",
     "name": "Kiwi Kill Switch",
-    "description": "Quick Settings toggle for the Kiwi fail-closed VPN kill switch: arm/disarm, pick a profile, and see live status (protected / trusted node / blocking / NOT PROTECTED). UI only — all firewall enforcement lives in the root kiwi-killswitchd daemon and is driven over the D-Bus system bus.",
+    "description": "Quick Settings toggle for the Kiwi fail-closed VPN kill switch: arm/disarm, pick which VPN connection is protected, and see live status (protected / trusted node / blocking / NOT PROTECTED). UI only — all firewall enforcement lives in the root kiwi-killswitchd daemon and is driven over the D-Bus system bus.",
     "shell-version": [
         "45", "46", "47", "48", "49", "50"
     ],

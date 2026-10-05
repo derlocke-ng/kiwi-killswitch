@@ -8,12 +8,17 @@
 #   KIWI_SCOPE=system  -> root backend: daemon, CLI, bus policy, systemd units
 #   KIWI_SCOPE=user    -> GNOME extension + GTK settings app (skipped headless)
 #
+# `uninstall --purge` (or KIWI_PURGE=1) also removes the saved settings. A plain
+# uninstall keeps them, so a reinstall picks up where you left off.
+#
 # The system scope needs root. Run it with sudo; it does not escalate by itself.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ACTION="${1:-${KIWI_ACTION:-install}}"
 SCOPE="${KIWI_SCOPE:-}"
+PURGE="${KIWI_PURGE:-0}"
+[[ " $* " == *" --purge "* ]] && PURGE=1
 
 EXT_UUID="kiwi-killswitch@kiwi-network.eu"
 BUS_NAME="eu.kiwinetwork.KillSwitch"
@@ -105,7 +110,16 @@ sys_uninstall() {
     # Disarm FIRST. Removing the daemon while armed leaves the machine blocked
     # with the tool that unblocks it already deleted.
     say "disarming before removal"
-    kiwi-killswitch disarm 2>/dev/null || true
+    if ! kiwi-killswitch disarm >/dev/null 2>&1; then
+        # The daemon is not answering, so nothing has undone what it changed on
+        # this machine: resolver overrides, management rules, the armed flag.
+        # Deleting the tables alone would leave DNS steered at a tunnel that is
+        # about to be unreachable. Its panic path does the whole teardown
+        # without needing the bus.
+        if [[ -x /usr/local/sbin/kiwi-killswitchd ]]; then
+            /usr/local/sbin/kiwi-killswitchd --panic >/dev/null 2>&1 || true
+        fi
+    fi
     nft delete table inet kiwi_ks 2>/dev/null || true
     nft delete table netdev kiwi_ks_egress 2>/dev/null || true
 
@@ -119,7 +133,12 @@ sys_uninstall() {
     busctl call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus \
         ReloadConfig 2>/dev/null || true
     systemctl daemon-reload
-    say "removed. Kept /etc/kiwi-killswitch (profiles + config) — delete it by hand if you want it gone."
+    if [[ $PURGE == 1 ]]; then
+        rm -rf /etc/kiwi-killswitch
+        say "removed, settings included (--purge)."
+    else
+        say "removed. Kept /etc/kiwi-killswitch (your settings) — uninstall with --purge to drop them too."
+    fi
 }
 
 # ---------------- user scope ------------------------------------------------
@@ -162,7 +181,7 @@ user_uninstall() {
 
 case "$ACTION" in
     install|update|uninstall) ;;
-    *) die "usage: $0 {install|update|uninstall}   (KIWI_SCOPE=system|user)" ;;
+    *) die "usage: $0 {install|update|uninstall [--purge]}   (KIWI_SCOPE=system|user)" ;;
 esac
 
 case "$SCOPE" in
