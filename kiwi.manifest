@@ -13,7 +13,7 @@ TAGS=vpn killswitch firewall privacy wireguard openvpn nftables dns leak
 SCOPES=user system
 ROOT_REASON=installs a root firewall daemon, its D-Bus policy and two systemd units, so the rules survive reboots and load before the network does
 
-ICON=
+ICON=data/kiwi-killswitch.svg
 SCREENSHOTS=data/screenshots/1-protected.png data/screenshots/2-hardening.png data/screenshots/3-reachable.png
 ABOUT=README.md
 DEPENDS=nft ip nmcli python3
