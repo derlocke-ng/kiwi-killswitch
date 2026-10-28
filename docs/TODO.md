@@ -5,6 +5,23 @@ as the code.
 
 ## Done
 
+### 2026-10-28 — 0.2.3: the kiwi-icons icon
+
+The settings app had a generic theme icon (`channel-secure-symbolic`), and
+kiwi-updater's explorer drew a placeholder tile until PR #1 shipped kiwi-icons'
+`svg/classic/kiwi-killswitch.svg` (kiwi-icons 162cbb1) as
+`data/kiwi-killswitch.svg` and named it in `ICON=`. This finishes what that PR
+left out: the icon is installed into hicolor under the app id,
+`eu.kiwinetwork.KiwiKillSwitch`, as kiwi-updater does with its own, so the
+desktop entry, the hicolor icon and the window all agree and GNOME can match a
+running window to its launcher. Nothing is fetched at install time. The user-scope installer puts it into hicolor and refreshes the
+caches; uninstall removes it. `tests/run.sh gui` checks that the four places
+agree and that the file renders. Checked on the test box: GTK resolves the
+name to the installed SVG.
+
+The Quick Settings toggle keeps its symbolic state icons on purpose — in the
+panel the icon *is* the status (open padlock, closed padlock, warning, error).
+
 ### 2026-10-05 — 0.2.2: what delivering 0.2.0 through kiwi-updater showed
 
 0.2.0 was installed on the test box by `kiwi update` (kiwi-updater 2.0.0, both

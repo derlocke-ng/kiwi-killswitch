@@ -879,6 +879,9 @@ class App(Adw.Application):
 
     def do_startup(self):
         Adw.Application.do_startup(self)
+        # every window this app opens — the error window included — carries the
+        # app's own icon (installed into hicolor under APP_ID by install.sh)
+        Gtk.Window.set_default_icon_name(APP_ID)
         provider = Gtk.CssProvider()
         provider.load_from_data(CSS)
         Gtk.StyleContext.add_provider_for_display(

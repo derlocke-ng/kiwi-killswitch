@@ -137,14 +137,43 @@ def run(app):
         except Exception as e:  # noqa: BLE001
             check(f"page builds: {builder.__name__}", False, repr(e))
     win.destroy()
+
+    # The icon: one id, four places. A mismatch anywhere shows a generic icon
+    # in the dock, or none in kiwi's app explorer, and nothing reports it.
+    repo = os.path.join(HERE, "..")
+    svg = "data/kiwi-killswitch.svg"
+    with open(os.path.join(repo, "kiwi.manifest")) as fh:
+        manifest = dict(ln.strip().split("=", 1) for ln in fh if "=" in ln and not ln.startswith("#"))
+    with open(os.path.join(repo, "data", "kiwi-killswitch.desktop")) as fh:
+        desktop = dict(ln.strip().split("=", 1) for ln in fh if "=" in ln)
+    check("the manifest's ICON is the vendored icon", manifest.get("ICON") == svg, manifest.get("ICON"))
+    check("the desktop entry uses the app id as its icon", desktop.get("Icon") == gui.APP_ID, desktop.get("Icon"))
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf
+    try:
+        pb = GdkPixbuf.Pixbuf.new_from_file_at_size(os.path.join(repo, svg), 64, 64)
+        check("the icon renders", pb.get_width() == 64)
+    except GLib.Error as e:
+        check("the icon renders", False, e.message)
+    check("windows carry the app's icon", Gtk.Window.get_default_icon_name() == gui.APP_ID,
+          str(Gtk.Window.get_default_icon_name()))
+
     with open(os.environ.get("GUI_RESULT", "/dev/null"), "w") as fh:
         fh.write(str(fails))
     app.quit()
     return False
 
 
-app = Adw.Application(application_id="eu.kiwinetwork.KiwiKillSwitch.Test",
-                      flags=Gio.ApplicationFlags.NON_UNIQUE)
-app.connect("activate", lambda a: (a.hold(), GLib.idle_add(run, a)))
+class TestApp(gui.App):
+    """The real app — its real startup (stylesheet, window icon) — with only
+    activation replaced, since that would talk to the real system bus."""
+
+    def do_activate(self):
+        self.hold()
+        GLib.idle_add(run, self)
+
+
+app = TestApp()
+app.set_flags(Gio.ApplicationFlags.NON_UNIQUE)
 app.run(None)
 sys.exit(1 if fails else 0)

@@ -22,6 +22,10 @@ PURGE="${KIWI_PURGE:-0}"
 
 EXT_UUID="kiwi-killswitch@kiwi-network.eu"
 BUS_NAME="eu.kiwinetwork.KillSwitch"
+# The settings app's id. The desktop entry, its icon and the window all carry
+# it, which is how GNOME matches a running window to its launcher. The icon is
+# kiwi-icons' classic kiwi-killswitch.svg (data/), installed under the app id.
+APP_ID="eu.kiwinetwork.KiwiKillSwitch"
 # Our own tools are called by full path. A root installer does not always get
 # /usr/local on its PATH — kiwi-updater's passwordless update runs it through
 # pkexec, which resets PATH to /usr/sbin:/usr/bin — and "command not found"
@@ -161,8 +165,16 @@ user_install() {
     say "installing the settings app"
     install -Dm755 "$SRC/gui/kiwi-killswitch-settings" \
         "$HOME/.local/bin/kiwi-killswitch-settings"
+    local data="${XDG_DATA_HOME:-$HOME/.local/share}"
     install -Dm644 "$SRC/data/kiwi-killswitch.desktop" \
-        "${XDG_DATA_HOME:-$HOME/.local/share}/applications/eu.kiwinetwork.KiwiKillSwitch.desktop"
+        "$data/applications/$APP_ID.desktop"
+    # one scalable icon rather than a pile of bitmaps, as kiwi-updater does
+    install -Dm644 "$SRC/data/kiwi-killswitch.svg" \
+        "$data/icons/hicolor/scalable/apps/$APP_ID.svg"
+    command -v gtk-update-icon-cache >/dev/null 2>&1 && \
+        gtk-update-icon-cache -qtf "$data/icons/hicolor" 2>/dev/null || true
+    command -v update-desktop-database >/dev/null 2>&1 && \
+        update-desktop-database -q "$data/applications" 2>/dev/null || true
 
     command -v gnome-extensions >/dev/null 2>&1 && \
         gnome-extensions enable "$EXT_UUID" 2>/dev/null || true
@@ -180,8 +192,12 @@ user_uninstall() {
     command -v gnome-extensions >/dev/null 2>&1 && \
         gnome-extensions disable "$EXT_UUID" 2>/dev/null || true
     rm -rf "$ext_dir"
+    local data="${XDG_DATA_HOME:-$HOME/.local/share}"
     rm -f "$HOME/.local/bin/kiwi-killswitch-settings" \
-          "${XDG_DATA_HOME:-$HOME/.local/share}/applications/eu.kiwinetwork.KiwiKillSwitch.desktop"
+          "$data/applications/$APP_ID.desktop" \
+          "$data/icons/hicolor/scalable/apps/$APP_ID.svg"
+    command -v gtk-update-icon-cache >/dev/null 2>&1 && \
+        gtk-update-icon-cache -qtf "$data/icons/hicolor" 2>/dev/null || true
     say "extension + settings app removed"
 }
 
