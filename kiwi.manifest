@@ -17,5 +17,11 @@ ICON=data/kiwi-killswitch.svg
 SCREENSHOTS=data/screenshots/1-protected.png data/screenshots/2-hardening.png data/screenshots/3-reachable.png
 ABOUT=README.md
 DEPENDS=nft ip nmcli python3
+# what to install when one is missing (kiwi offers it; `kiwi config auto-deps yes` just does it)
+PACKAGES_DNF=nftables iproute NetworkManager python3 python3-gobject
+PACKAGES_APT=nftables iproute2 network-manager python3 python3-gi
+PACKAGES_PACMAN=nftables iproute2 networkmanager python python-gobject
+PACKAGES_ZYPPER=nftables iproute2 NetworkManager python3 python3-gobject
+PACKAGES_APK=nftables iproute2 networkmanager python3 py3-gobject3
 
 INSTALLER=install.sh

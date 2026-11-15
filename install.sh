@@ -62,15 +62,24 @@ want_gui() {
 }
 
 # ---------------- system scope (root): the daemon ---------------------------
+# "the command that installs <need>… here", from kiwi when it is installed
+pkg_hint() {
+    local k
+    for k in /usr/local/bin/kiwi "$(command -v kiwi 2>/dev/null)"; do
+        [[ -n $k && -x $k ]] && "$k" pkg-hint "$@" 2>/dev/null && return
+    done
+    echo "install them with your package manager"
+}
+
 sys_preflight() {
     [[ $EUID -eq 0 ]] || die "system scope needs root — try: sudo $0 $ACTION"
     local missing=()
     for t in nft ip nmcli python3; do
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
-    (( ${#missing[@]} )) && die "missing required tools: ${missing[*]}"
+    (( ${#missing[@]} )) && die "missing required tools: ${missing[*]} — $(pkg_hint "${missing[@]}")"
     python3 -c 'import gi; gi.require_version("Gio","2.0")' 2>/dev/null \
-        || die "python3 PyGObject (gi) is required"
+        || die "python3 PyGObject (gi) is required — $(pkg_hint pygobject)"
     command -v wg        >/dev/null 2>&1 || warn "wg not found — WireGuard endpoint detection will be limited"
     command -v resolvectl >/dev/null 2>&1 || warn "resolvectl not found — DNS steering will be skipped"
     return 0
@@ -120,8 +129,8 @@ sys_install() {
     # first CLI or GUI call fail for no visible reason. Wait for a real method
     # call to succeed, not merely for the name to appear: those are different
     # moments, and only the second one means the daemon is usable.
-    local i ready=0
-    for i in $(seq 40); do
+    local ready=0
+    for _ in $(seq 40); do
         if "$CLI" status >/dev/null 2>&1; then ready=1; break; fi
         sleep 0.25
     done
