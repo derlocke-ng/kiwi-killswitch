@@ -37,6 +37,18 @@ say()  { printf ':: %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# The admin group this distribution uses: wheel on Fedora, Arch, openSUSE and
+# Alpine; sudo on Debian and Ubuntu, which have no wheel group. The bus policy
+# grants passwordless control to that group, so it must be the one admins are
+# actually in.
+admin_group() {
+    local g
+    for g in wheel sudo admin; do
+        grep -q "^$g:" /etc/group 2>/dev/null && { echo "$g"; return 0; }
+    done
+    return 1
+}
+
 # With no explicit scope, do the sensible thing for whoever is running us.
 if [[ -z $SCOPE ]]; then
     if [[ $EUID -eq 0 ]]; then SCOPE=system; else SCOPE=user; fi
@@ -69,8 +81,20 @@ sys_install() {
     say "installing kiwi-killswitchd (root daemon) + D-Bus service"
     install -Dm755 "$SRC/daemon/kiwi-killswitchd" "$DAEMON"
     install -Dm755 "$SRC/bin/kiwi-killswitch"     "$CLI"
-    install -Dm644 "$SRC/data/dbus/$BUS_NAME.conf" \
-        "/etc/dbus-1/system.d/$BUS_NAME.conf"
+    local grp
+    grp="$(admin_group)" || { grp=""; warn "no wheel, sudo or admin group — only root can control the daemon"; }
+    # the shipped policy names wheel; write this machine's admin group instead
+    # (no group at all: drop that <policy> block, root keeps its own)
+    mkdir -p /etc/dbus-1/system.d
+    if [[ -n $grp ]]; then
+        sed "s/<policy group=\"wheel\">/<policy group=\"$grp\">/" "$SRC/data/dbus/$BUS_NAME.conf" \
+            > "/etc/dbus-1/system.d/$BUS_NAME.conf"
+    else
+        sed '/<policy group="wheel">/,/<\/policy>/d' "$SRC/data/dbus/$BUS_NAME.conf" \
+            > "/etc/dbus-1/system.d/$BUS_NAME.conf"
+    fi
+    chmod 644 "/etc/dbus-1/system.d/$BUS_NAME.conf"
+    say "passwordless control for members of '${grp:-<none>}' (D-Bus policy)"
     install -Dm644 "$SRC/data/systemd/kiwi-killswitchd.service" \
         /etc/systemd/system/kiwi-killswitchd.service
     install -Dm644 "$SRC/data/systemd/kiwi-killswitch-boot.service" \
@@ -179,8 +203,9 @@ user_install() {
     command -v gnome-extensions >/dev/null 2>&1 && \
         gnome-extensions enable "$EXT_UUID" 2>/dev/null || true
 
-    id -nG "$USER" | tr ' ' '\n' | grep -qx wheel || \
-        warn "$USER is not in the 'wheel' group — the daemon's bus policy will deny it. Fix: sudo usermod -aG wheel $USER"
+    local grp; grp="$(admin_group)" || grp=wheel
+    id -nG "$USER" | tr ' ' '\n' | grep -qx "$grp" || \
+        warn "$USER is not in the '$grp' group — the daemon's bus policy will deny it. Fix: sudo usermod -aG $grp $USER, then log in again"
 
     say "installed — log out and back in (or Alt+F2 'r' on X11) to load the extension"
 }
