@@ -85,7 +85,13 @@ case "${1:-status}" in
                   echo "disarmed"
               else
                   echo "daemon not answering — tearing it down directly (needs root)" >&2
-                  exec sudo /usr/local/sbin/kiwi-killswitchd --panic
+                  # whichever way to root this system has: sudo (Fedora,
+                  # Debian, Ubuntu…), doas (Alpine), run0, or pkexec
+                  for r in sudo doas run0 pkexec; do
+                      command -v "$r" >/dev/null 2>&1 && exec "$r" /usr/local/sbin/kiwi-killswitchd --panic
+                  done
+                  echo "no sudo, doas, run0 or pkexec — run as root: /usr/local/sbin/kiwi-killswitchd --panic" >&2
+                  exit 1
               fi ;;
 
     nodes)    call ListNodes \

@@ -37,6 +37,18 @@ say()  { printf ':: %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# The admin group this distribution uses: wheel on Fedora, Arch, openSUSE and
+# Alpine; sudo on Debian and Ubuntu, which have no wheel group. The bus policy
+# grants passwordless control to that group, so it must be the one admins are
+# actually in.
+admin_group() {
+    local g
+    for g in wheel sudo admin; do
+        grep -q "^$g:" /etc/group 2>/dev/null && { echo "$g"; return 0; }
+    done
+    return 1
+}
+
 # With no explicit scope, do the sensible thing for whoever is running us.
 if [[ -z $SCOPE ]]; then
     if [[ $EUID -eq 0 ]]; then SCOPE=system; else SCOPE=user; fi
@@ -50,15 +62,24 @@ want_gui() {
 }
 
 # ---------------- system scope (root): the daemon ---------------------------
+# "the command that installs <need>… here", from kiwi when it is installed
+pkg_hint() {
+    local k
+    for k in /usr/local/bin/kiwi "$(command -v kiwi 2>/dev/null)"; do
+        [[ -n $k && -x $k ]] && "$k" pkg-hint "$@" 2>/dev/null && return
+    done
+    echo "install them with your package manager"
+}
+
 sys_preflight() {
     [[ $EUID -eq 0 ]] || die "system scope needs root — try: sudo $0 $ACTION"
     local missing=()
     for t in nft ip nmcli python3; do
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
-    (( ${#missing[@]} )) && die "missing required tools: ${missing[*]}"
+    (( ${#missing[@]} )) && die "missing required tools: ${missing[*]} — $(pkg_hint "${missing[@]}")"
     python3 -c 'import gi; gi.require_version("Gio","2.0")' 2>/dev/null \
-        || die "python3 PyGObject (gi) is required"
+        || die "python3 PyGObject (gi) is required — $(pkg_hint pygobject)"
     command -v wg        >/dev/null 2>&1 || warn "wg not found — WireGuard endpoint detection will be limited"
     command -v resolvectl >/dev/null 2>&1 || warn "resolvectl not found — DNS steering will be skipped"
     return 0
@@ -69,8 +90,20 @@ sys_install() {
     say "installing kiwi-killswitchd (root daemon) + D-Bus service"
     install -Dm755 "$SRC/daemon/kiwi-killswitchd" "$DAEMON"
     install -Dm755 "$SRC/bin/kiwi-killswitch"     "$CLI"
-    install -Dm644 "$SRC/data/dbus/$BUS_NAME.conf" \
-        "/etc/dbus-1/system.d/$BUS_NAME.conf"
+    local grp
+    grp="$(admin_group)" || { grp=""; warn "no wheel, sudo or admin group — only root can control the daemon"; }
+    # the shipped policy names wheel; write this machine's admin group instead
+    # (no group at all: drop that <policy> block, root keeps its own)
+    mkdir -p /etc/dbus-1/system.d
+    if [[ -n $grp ]]; then
+        sed "s/<policy group=\"wheel\">/<policy group=\"$grp\">/" "$SRC/data/dbus/$BUS_NAME.conf" \
+            > "/etc/dbus-1/system.d/$BUS_NAME.conf"
+    else
+        sed '/<policy group="wheel">/,/<\/policy>/d' "$SRC/data/dbus/$BUS_NAME.conf" \
+            > "/etc/dbus-1/system.d/$BUS_NAME.conf"
+    fi
+    chmod 644 "/etc/dbus-1/system.d/$BUS_NAME.conf"
+    say "passwordless control for members of '${grp:-<none>}' (D-Bus policy)"
     install -Dm644 "$SRC/data/systemd/kiwi-killswitchd.service" \
         /etc/systemd/system/kiwi-killswitchd.service
     install -Dm644 "$SRC/data/systemd/kiwi-killswitch-boot.service" \
@@ -96,8 +129,8 @@ sys_install() {
     # first CLI or GUI call fail for no visible reason. Wait for a real method
     # call to succeed, not merely for the name to appear: those are different
     # moments, and only the second one means the daemon is usable.
-    local i ready=0
-    for i in $(seq 40); do
+    local ready=0
+    for _ in $(seq 40); do
         if "$CLI" status >/dev/null 2>&1; then ready=1; break; fi
         sleep 0.25
     done
@@ -179,8 +212,9 @@ user_install() {
     command -v gnome-extensions >/dev/null 2>&1 && \
         gnome-extensions enable "$EXT_UUID" 2>/dev/null || true
 
-    id -nG "$USER" | tr ' ' '\n' | grep -qx wheel || \
-        warn "$USER is not in the 'wheel' group — the daemon's bus policy will deny it. Fix: sudo usermod -aG wheel $USER"
+    local grp; grp="$(admin_group)" || grp=wheel
+    id -nG "$USER" | tr ' ' '\n' | grep -qx "$grp" || \
+        warn "$USER is not in the '$grp' group — the daemon's bus policy will deny it. Fix: sudo usermod -aG $grp $USER, then log in again"
 
     say "installed — log out and back in (or Alt+F2 'r' on X11) to load the extension"
 }

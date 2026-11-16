@@ -15,7 +15,7 @@ a leak-proof firewall around whatever is actually alive.
 │  kiwi-killswitch-settings (GTK4)          │──▶│   nftables  (inet + netdev) │
 │  kiwi-killswitch (CLI)                    │   │   systemd-resolved steering │
 └───────────────────────────────────────────┘   │   NM + kernel event watcher │
-             D-Bus system bus, group `wheel`    └─────────────────────────────┘
+             D-Bus system bus, admin group      └─────────────────────────────┘
 ```
 
 A GNOME extension is an unprivileged process: it *cannot* and *must not* touch the
@@ -68,7 +68,8 @@ sudo ./install.sh install     # root daemon, CLI, bus policy, systemd units
 ./install.sh install          # GNOME extension + settings app
 ```
 
-Log out and back in so GNOME loads the extension. Your user must be in `wheel` — that is
+Log out and back in so GNOME loads the extension. Your user must be in the admin group
+(`wheel`; `sudo` on Debian and Ubuntu) — that is
 what the bus policy authorizes.
 
 Via [kiwi-updater](https://github.com/derlocke-ng/kiwi-updater):
@@ -199,7 +200,8 @@ after any change, then follow [docs/RUNBOOK.md](docs/RUNBOOK.md) on hardware.
 
 ## Security notes
 
-- Passwordless control is the D-Bus **bus policy** for group `wheel`
+- Passwordless control is the D-Bus **bus policy** for the admin group (`wheel`; `sudo` on
+  Debian and Ubuntu, filled in at install time)
   ([data/dbus](data/dbus/eu.kiwinetwork.KillSwitch.conf)) — not a pkexec rule, and not
   sudoers. The daemon exposes a fixed set of validated methods, never "run this as root".
   Don't loosen it. It also means any program running as you can turn the switch off

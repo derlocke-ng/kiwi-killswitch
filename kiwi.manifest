@@ -1,7 +1,7 @@
 # kiwi.manifest — app metadata for the kiwi updater
 NAME=kiwi-killswitch
 DESCRIPTION=Fail-closed VPN kill switch for GNOME on Silverblue — one VPN, no leaks, no password prompts
-VERSION=0.2.3
+VERSION=0.2.4
 AUTHOR=derlocke-ng
 HOMEPAGE=https://github.com/derlocke-ng/kiwi-killswitch
 LICENSE=GPL-3.0-or-later
@@ -17,5 +17,11 @@ ICON=data/kiwi-killswitch.svg
 SCREENSHOTS=data/screenshots/1-protected.png data/screenshots/2-hardening.png data/screenshots/3-reachable.png
 ABOUT=README.md
 DEPENDS=nft ip nmcli python3
+# what to install when one is missing (kiwi offers it; `kiwi config auto-deps yes` just does it)
+PACKAGES_DNF=nftables iproute NetworkManager python3 python3-gobject
+PACKAGES_APT=nftables iproute2 network-manager python3 python3-gi
+PACKAGES_PACMAN=nftables iproute2 networkmanager python python-gobject
+PACKAGES_ZYPPER=nftables iproute2 NetworkManager python3 python3-gobject
+PACKAGES_APK=nftables iproute2 networkmanager python3 py3-gobject3
 
 INSTALLER=install.sh
