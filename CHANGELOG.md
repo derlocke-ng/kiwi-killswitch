@@ -3,7 +3,7 @@
 Releases of kiwi-killswitch. The newest is on top; its heading is the
 version in kiwi.manifest.
 
-## 0.2.5 — unreleased
+## 0.2.5 — 2026-11-21
 
 - **GNOME 51.** The Quick Settings toggle declares GNOME Shell 51; GNOME
   showed it as out of date and did not load it. It uses none of the APIs
