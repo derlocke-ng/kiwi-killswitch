@@ -1,0 +1,6 @@
+# Keys whose signatures on release tags the release workflow accepts.
+# Format: ssh-keygen(1) ALLOWED SIGNERS. Each machine's root pins its own copy of
+# the key from the first release it installs; changing keys means users run
+#   kiwi trust --system <app>
+# so say so in the release notes. Written by kiwi-release setup.
+derlocke-ng namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOgQc/J6GUopStnNbqhY0QM/k5krVteKyWj4e6qyZX+r
